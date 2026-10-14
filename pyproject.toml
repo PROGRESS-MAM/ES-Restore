@@ -20,10 +20,10 @@ build = [
 ]
 
 
-[tool.setuptools]
-py-modules = ["restorer"]
-packages = ["marathon"]
-
-
 [tool.setuptools.dynamic]
-version = {attr = "restorer.app_version"}
+version = {attr = "restorer.restorer.app_version"}
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["restorer*", "marathon*"]

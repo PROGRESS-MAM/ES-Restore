@@ -23,12 +23,12 @@ from toolbox import tb_link_api, tb_write_log
 
 # --------- CONFIG ---------
 app_name = "ES-Restore"
-app_version = "0.2.0"
+app_version = "0.2.1"
 
-module_folder = Path(__file__).resolve().parent
-default_cred_path = module_folder / "cred.env"
-default_journal_path = module_folder / "restorer.journal.json"
-default_log_path = module_folder / "restorer.log"
+project_folder = Path(__file__).resolve().parents[1]   # installed: site-packages, callers pass their paths
+default_cred_path = project_folder / "cred.env"
+default_journal_path = project_folder / "restorer.journal.json"
+default_log_path = project_folder / "restorer.log"
 
 ark_sources = ["tape"]
 lost_search_minutes = 15            # minimum search for an Ark job whose creation got no answer

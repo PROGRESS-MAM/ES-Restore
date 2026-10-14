@@ -1,12 +1,12 @@
 # ES-Restore
 
-Holt Dateien per FLOW-Hash über die ARK-API vom LTO-Band in einen Zielordner. `restorer.py` ist universell einsetzbar. Der Marathon-Adapter macht daraus einen Restore-Worker für Marathon: Er übernimmt Restore-Jobs aus dem Pool, lässt die Dateien von Ark zurückholen und meldet je Datei das Ergebnis an Marathon.
+Holt Dateien per FLOW-Hash über die ARK-API vom LTO-Band in einen Zielordner. Das Paket `restorer` ist universell einsetzbar. Der Marathon-Adapter macht daraus einen Restore-Worker für Marathon: Er übernimmt Restore-Jobs aus dem Pool, lässt die Dateien von Ark zurückholen und meldet je Datei das Ergebnis an Marathon.
 
 ## Aufbau
 
 | Pfad | Aufgabe |
 |---|---|
-| `restorer.py` | Modul: `run()`, `versions()` |
+| `restorer/` | Paket: `run()`, `versions()`, `RestorerJob`, `RestorerResult`; Code in `restorer/restorer.py` |
 | `cred.env` | Ark-Zugangsdaten für das Modul, nur lokal |
 | `marathon/marathon_adapter.py` | allgemeiner Teil aller Marathon-Adapter, **nicht verändern** (ab 1.2.0) |
 | `marathon/restore_marathon.py` | Restore-Adapter: Einstellungen, Einstieg der EXE |
@@ -74,7 +74,7 @@ Pfade werden in Konsole und Log ab einschließlich `.marathon` gekürzt (`.marat
 python marathon/build_restore.py
 ```
 
-Ergebnis: `dist/restore_marathon_<app_version>.exe` mit Adapter, `restorer.py`, toolbox und `marathon/cred.env`. Änderungen an Einstellungen oder Zugangsdaten gelten erst mit einem neuen Build.
+Ergebnis: `dist/restore_marathon_<app_version>.exe` mit Adapter, Paket `restorer`, toolbox und `marathon/cred.env`. Änderungen an Einstellungen oder Zugangsdaten gelten erst mit einem neuen Build.
 
 ## Einstellungen in `restore_marathon.py`
 
@@ -115,6 +115,8 @@ def on_result(job, result):
 run([RestorerJob("auftrag-1", items, r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\restore")], on_result)
 ```
 
+Ist `restorer` in ein anderes Projekt installiert, zeigen die Standardpfade ins Installationsverzeichnis von Python; dann `cred_path`, `journal_path` und `log_path` angeben.
+
 `run()` kehrt zurück, wenn `jobs` erschöpft ist und alle Ark-Jobs beendet sind. Es gibt nichts zurück; jedes Ergebnis kommt über `on_result`.
 
 | Parameter | Standard | Bedeutung |
@@ -124,8 +126,8 @@ run([RestorerJob("auftrag-1", items, r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 M
 | `on_log(message)` | Konsole mit Uhrzeit und `log_path` | Ereigniszeilen |
 | `on_status(lines)` | Konsole | Statusblock, je Ark-Job eine Zeile; ohne echte Konsole nicht ausgegeben |
 | `cred_path` | `cred.env` im Projektordner | Ark-Zugangsdaten |
-| `journal_path` | `restorer.journal.json` neben `restorer.py` | Journal |
-| `log_path` | `restorer.log` neben `restorer.py` | Log, nur ohne `on_log` |
+| `journal_path` | `restorer.journal.json` im Projektordner | Journal |
+| `log_path` | `restorer.log` im Projektordner | Log, nur ohne `on_log` |
 | `poll_seconds` | `10` | Abfrageintervall |
 | `max_ark_queue` | `0` | Steuerung, siehe „Steuerung“ |
 | `stall_minutes` | `60` | Minuten ohne Fortschritt im Status `Running` bis zum Stopp |
