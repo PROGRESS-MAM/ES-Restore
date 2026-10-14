@@ -1,2 +1,10 @@
-.venv
 cred.env
+*.log
+*.journal.json
+*.journal.json.tmp
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+.venv/

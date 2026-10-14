@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+
+[project]
+name = "es-restore"
+description = "Dateien per FLOW-Hash über Ark vom LTO-Band zurückholen"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["version"]
+dependencies = [
+    "toolbox @ git+https://github.com/PROGRESS-MAM/TOOLBOX.git@main",
+]
+
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6",
+]
+
+
+[tool.setuptools]
+py-modules = ["restorer"]
+packages = ["marathon"]
+
+
+[tool.setuptools.dynamic]
+version = {attr = "restorer.app_version"}
