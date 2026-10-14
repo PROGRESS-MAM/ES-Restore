@@ -23,7 +23,7 @@ from toolbox import tb_link_api, tb_write_log
 
 # --------- CONFIG ---------
 app_name = "ES-Restore"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
 module_folder = Path(__file__).resolve().parent
 default_cred_path = module_folder / "cred.env"
@@ -34,8 +34,6 @@ ark_sources = ["tape"]
 lost_search_minutes = 15            # minimum search for an Ark job whose creation got no answer
 not_found_limit = 3                 # polls without hit before a new Ark job counts as orphaned
 restop_minutes = 5
-notification_idle_minutes = 5
-notification_pause_minutes = 2
 mediaspace_cache_minutes = 5
 clock_tolerance_seconds = 120       # Ark clock vs. local clock when matching a job without session id
 bytes_tolerance = 0.15              # rounded total_bytes of Ark vs. sum of sizes
@@ -141,7 +139,6 @@ class _ArkJob:
     progress: str = ""
     remaining: str = ""
     transferred: int = 0
-    last_change: float = field(default_factory=time.monotonic)
     stall_since: float = field(default_factory=time.monotonic)
     not_found: int = 0
     from_journal: bool = False
@@ -435,7 +432,7 @@ class _Runner:
         self.tape_servers: dict[str, str] = {}
         self.alert_totals: dict[str, int] = {}
         self.alert_last: dict[str, int] = {}
-        self.notification_last, self.notification_read = 0, -math.inf
+        self.notification_last = 0
         self.details_cache: dict[str, dict] = {}
         self.create_queue, self.created_queue = queue.Queue(), queue.Queue()
         threading.Thread(target=self._creator, daemon=True).start()
@@ -453,8 +450,8 @@ class _Runner:
             active = self._read_active()
             if active is not None:
                 self._watch(active)
-                self._check_alerts()
                 self._read_notifications()
+                self._check_alerts()
                 self._send(active)
             self._finish_tasks()
             self.on_status(self._status_lines())
@@ -637,8 +634,6 @@ class _Runner:
         todo = [f for f in todo if f.state == "open"]
         if todo:
             todo = self._check_ark(todo)
-        if todo:
-            todo = self._check_space(task, todo)
         groups: dict[tuple[str, ...], list[_File]] = {}
         for f in todo:
             groups.setdefault(f.group, []).append(f)
@@ -687,29 +682,47 @@ class _Runner:
                 fail(f, "TAPES_OFFLINE", f"Band {', '.join(offline)} nicht in der Library")
         return [f for f in files if f.state == "open"]
 
-    def _check_space(self, task: _Task, files: list[_File]) -> list[_File]:
-        try:
-            free = _free_bytes(task.share_root)
-        except OSError as exc:
-            problem = _reason("INVALID_INPUT", f"Ziel {task.share_root} nicht erreichbar: {exc}")
-        else:
-            pending = sum(job.remaining_bytes() for job in self.ark_list if job.share_root.casefold() == task.share_root.casefold())
-            need = sum(f.size for f in files) + self.reserve
-            if free - pending >= need:
-                return files
-            problem = _reason("NO_SPACE", f"frei {_gb(free)}, davon {_gb(pending)} für laufende Ark-Jobs, nötig {_gb(need)} inkl. Reserve")
-        for f in files:
-            f.state, f.reason = "failed", problem
-        return []
-
     # --------- control and creation ---------
     def _send(self, active: dict[str, dict]) -> None:
         waiting = sum(str(entry.get("current_status") or "").startswith("Enqueued") for entry in active.values())
         waiting += sum(job.state in ("creating", "lost") or (job.state == "active" and job.session_id not in active) for job in self.ark_list)
         free = math.inf if self.max_ark_queue == 0 else self.max_ark_queue - waiting
         while free > 0 and (job := self._next_job()):
+            if job.attempt > 1:
+                self._delete_partials(job)
+            if problem := self._space_problem(job, active):
+                self._fail(job, job.files, problem)
+                job.state = "done"
+                self.ark_list.remove(job)
+                self.log(f"Ark-Job für {job.key} nicht gesendet: {problem}")
+                continue
             self._launch(job)
             free -= 1
+
+    def _space_problem(self, job: _ArkJob, active: dict[str, dict]) -> str | None:
+        """Free space at the share minus outstanding bytes of all restores in Ark to the same media space."""
+        try:
+            free = _free_bytes(job.share_root)
+        except OSError as exc:
+            return _reason("INVALID_INPUT", f"Ziel {job.share_root} nicht erreichbar: {exc}")
+        space = job.mediaspace.casefold()
+        own_ids = self.journal.session_ids() | {other.session_id for other in self.ark_list if other.session_id}
+        own = sum(other.remaining_bytes() for other in self.ark_list
+                  if other is not job and other.state in ("creating", "lost", "active") and other.mediaspace.casefold() == space)
+        foreign = 0
+        for session_id, entry in active.items():
+            current = str(entry.get("current_space") or "").casefold()
+            if session_id in own_ids or not session_id.startswith("restorejob_") or (current and current != space):
+                continue
+            # Waiting jobs have no byte figures yet; reserve_gb covers them.
+            foreign += sum(max(0, _parse_bytes(item.get("total_bytes")) - _parse_bytes(item.get("bytes")))
+                           for item in _listed(self._details(session_id, "active_jobs").get("spaces"))
+                           if str(item.get("name") or "").casefold() == space)
+        need = sum(f.size for f in job.files) + self.reserve
+        if free - own - foreign >= need:
+            return None
+        return _reason("NO_SPACE", f"frei {_gb(free)}, ausstehend {_gb(own + foreign)} (davon fremd {_gb(foreign)}), "
+                                   f"nötig {_gb(need)} inkl. Reserve")
 
     def _next_job(self) -> _ArkJob | None:
         while True:
@@ -733,15 +746,16 @@ class _Runner:
         self.ark_list.remove(job)
         return False
 
+    def _delete_partials(self, job: _ArkJob) -> None:
+        for f in job.files:
+            if f.target.exists() and not _complete(f):
+                try:
+                    f.target.unlink()
+                    self.log(f"Unvollständige Datei gelöscht: {f.target}")
+                except OSError as exc:
+                    self.log(f"Unvollständige Datei nicht löschbar: {f.target} ({exc})")
+
     def _launch(self, job: _ArkJob) -> None:
-        if job.attempt > 1:
-            for f in job.files:
-                if f.target.exists() and not _complete(f):
-                    try:
-                        f.target.unlink()
-                        self.log(f"Unvollständige Datei gelöscht: {f.target}")
-                    except OSError as exc:
-                        self.log(f"Unvollständige Datei nicht löschbar: {f.target} ({exc})")
         job.state, job.created_at = "creating", datetime.now()
         self.journal.put(job)
         self.create_queue.put(job)
@@ -777,7 +791,7 @@ class _Runner:
             elif _ok(result):
                 job.state, job.session_id = "active", result.data["session_id"]
                 job.start = _session_start(job.session_id) or datetime.now()
-                job.last_change = job.stall_since = time.monotonic()
+                job.stall_since = time.monotonic()
                 self.journal.put(job)
                 self.log(f"Ark-Job {job.short} angelegt für {job.key}: Band {job.tapes}, {len(job.files)} Dateien → "
                          f"{job.mediaspace}/{job.files[0].restore_path.rsplit('/', 2)[0]}")
@@ -834,7 +848,7 @@ class _Runner:
             progress = " + ".join(str(space["bytes"]) for space in spaces if space.get("bytes")) or str(entry.get("progress_txt") or "")
             job.remaining = str(data.get("remaining") or job.remaining)
             if progress != job.progress:
-                job.progress, job.last_change, job.stall_since = progress, now, now
+                job.progress, job.stall_since = progress, now
                 job.transferred = sum(_parse_bytes(space.get("bytes")) for space in spaces) or _parse_bytes(progress)
             if now - job.stall_since > self.stall_seconds:
                 self._stop(job, "STALLED", f"seit {self.stall_seconds / 60:g} min kein Fortschritt (zuletzt {job.progress or '–'})", "Überwachung")
@@ -911,7 +925,7 @@ class _Runner:
         if len(matches) == 1:
             job.session_id, job.state = matches[0][0], "active"
             job.start = _session_start(job.session_id)
-            job.last_change = job.stall_since = time.monotonic()
+            job.stall_since = time.monotonic()
             self.journal.put(job)
             self.log(f"Ark-Job {job.short} für {job.key} gefunden und zugeordnet.")
             return
@@ -1044,7 +1058,6 @@ class _Runner:
             self.alert_totals[address] = total
             fresh += [(server_id, alert) for alert in alerts]
         if fresh and any(job.state == "active" for job in self.ark_list):
-            self._read_notifications(force=True)
             self._handle_alerts(fresh)
 
     def _tape_server(self, address: str) -> str | None:
@@ -1102,15 +1115,11 @@ class _Runner:
                      f"zu Ark-Job {job.short} {outcome}.")
         job.acks.clear()
 
-    def _read_notifications(self, *, force: bool = False, baseline: bool = False) -> None:
-        """New notifications: tape job numbers of own Ark jobs and missing tapes; the answer is large, so read rarely."""
-        now = time.monotonic()
+    def _read_notifications(self, *, baseline: bool = False) -> None:
+        """New notifications at every poll while own Ark jobs are in Ark; the start only sets the baseline."""
         jobs = [job for job in self.ark_list if job.state == "active" and job.session_id]
-        if not baseline:
-            idle = any(now - job.last_change >= notification_idle_minutes * 60 for job in jobs)
-            if not jobs or not (force or idle) or now - self.notification_read < notification_pause_minutes * 60:
-                return
-        self.notification_read = now
+        if not baseline and not jobs:
+            return
         result = self.ark.get_notifications()
         if not _ok(result):
             return

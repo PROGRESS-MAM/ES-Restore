@@ -89,7 +89,7 @@ Ergebnis: `dist/restore_marathon_<app_version>.exe` mit Adapter, `restorer.py`, 
 | `heartbeat_seconds` | `30` | Abstand der Lebenszeichen an Marathon, 1 bis 60 |
 | `max_ark_queue` | `1` | Steuerung, siehe „Steuerung“ |
 | `stall_minutes` | `60` | Minuten ohne Fortschritt im Status `Running` bis zum Stopp |
-| `reserve_gb` | `50` | Platzreserve im Ziel in GB (10^9 Byte) |
+| `reserve_gb` | `500` | Platzreserve im Ziel in GB (10^9 Byte); deckt auch wartende Ark-Jobs ab, für die Ark noch keine Datenmenge meldet |
 
 ## Ergebnis eines Marathon-Jobs
 
@@ -170,8 +170,8 @@ Je Datei ein Eintrag, alle Felder Pflicht:
 1. Eingabe prüfen: Pflichtfelder, Hash-Format, doppelte Einträge, Zielpfad.
 2. Bereits vollständige Dateien als `restored` übernehmen.
 3. Bei Ark prüfen: Datei bekannt, angegebenes Band unter ihren Kopien, Band in der Library. Sonst sofort `failed`; auf Bänder wird nicht gewartet.
-4. Speicherplatz prüfen: freier Platz an `\\server\freigabe\` abzüglich der noch ausstehenden Bytes laufender eigener Ark-Jobs muss für die offenen Dateien plus `reserve_gb` reichen. Sonst `failed` mit `NO_SPACE`, kein Ark-Job.
-5. Je Band bzw. Bandkombination ein Ark-Job, gesendet nach der Steuerung.
+4. Je Band bzw. Bandkombination ein Ark-Job, gesendet nach der Steuerung.
+5. Vor dem Senden jedes Ark-Jobs, auch nach Halbieren oder Neusenden: freier Platz an `\\server\freigabe\` abzüglich der ausstehenden Bytes aller Restores in Ark zum selben Media Space (eigene und fremde) muss für die Dateien dieses Ark-Jobs plus `reserve_gb` reichen. Sonst scheitern seine Dateien mit `NO_SPACE`; andere Ark-Jobs laufen weiter. Wartende Ark-Jobs ohne Datenmenge deckt `reserve_gb` ab.
 6. Überwachen, bei Bedarf stoppen, neu senden oder halbieren (siehe „Fälle“).
 7. Jede Datei prüfen und Ergebnis über `on_result` melden.
 
