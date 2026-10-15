@@ -28,7 +28,16 @@ pip install -e .            # toolbox mit ArkAPI und FlowAPI
 pip install -e ".[build]"   # zusätzlich pyinstaller für den Build
 ```
 
-## Zugangsdaten `cred.env`
+In ein anderes Projekt installieren:
+
+```
+pip install "es-restore @ git+https://github.com/PROGRESS-MAM/ES-Restore.git@main"
+```
+
+Aktualisieren mit `pip install --force-reinstall --no-deps "es-restore @ git+https://github.com/PROGRESS-MAM/ES-Restore.git@main"`. Die Paketquelle der Flow-API muss eingetragen sein (siehe Installation).
+
+
+Zugangsdaten `cred.env`
 
 ```
 ARK_HOST=<host>
