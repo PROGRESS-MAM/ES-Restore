@@ -23,7 +23,7 @@ from toolbox import tb_link_api, tb_write_log
 
 # --------- CONFIG ---------
 app_name = "ES-Restore"
-app_version = "0.2.1"
+app_version = "0.3.0"
 
 project_folder = Path(__file__).resolve().parents[1]   # installed: site-packages, callers pass their paths
 default_cred_path = project_folder / "cred.env"
@@ -116,6 +116,7 @@ class _Task:
     files: list[_File] = field(default_factory=list)
     ark_jobs: list["_ArkJob"] = field(default_factory=list)
     defect_tapes: set[str] = field(default_factory=set)
+    reported: set[str] = field(default_factory=set)        # clip_ids already handed to on_clip
     problem: str | None = None
     mediaspace: str = ""
     share_root: str = ""
@@ -152,6 +153,8 @@ class _ArkJob:
     ark_text: str = ""
     results: dict[str, str | None] = field(default_factory=dict)    # target -> None (restored) or reason
     decided: bool = False
+    tape_wait: bool = False                 # waiting for a tape held by another own Ark job, logged once
+    space_wait: str | None = None           # missing space while waiting to be sent
 
     @property
     def short(self) -> str:
@@ -159,7 +162,13 @@ class _ArkJob:
 
     @property
     def tapes(self) -> str:
-        return "+".join(dict.fromkeys(tape for f in self.files for tape in (f.group or (f.tape,)))) or "–"
+        return "+".join(self.tape_list()) or "–"
+
+    def tape_list(self) -> list[str]:
+        return list(dict.fromkeys(tape for f in self.files for tape in (f.group or (f.tape,))))
+
+    def tape_set(self) -> set[str]:
+        return {tape.casefold() for tape in self.tape_list()}
 
     def copy_tapes(self) -> set[str]:
         return {tape.casefold() for f in self.files for copy in f.copies or [[f.tape]] for tape in copy}
@@ -377,10 +386,12 @@ def _job_from_entry(entry: dict) -> _ArkJob:
 
 
 class _Journal:
-    """All Ark jobs this restorer created and not yet cleaned up; used by exactly one process."""
+    """All Ark jobs this restorer created and not yet cleaned up, plus clips of open orders already handed to on_clip;
+    used by exactly one process."""
 
     def __init__(self, path: Path) -> None:
         self.path, self.entries = path, {}
+        self.reported: dict[str, dict[str, list[dict]]] = {}     # key -> clip_id -> file results
 
     def load(self) -> list[dict]:
         try:
@@ -390,9 +401,12 @@ class _Journal:
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"Journal {self.path} nicht lesbar ({exc}). Datei prüfen; ohne Journal können Ark-Jobs doppelt laufen.") from exc
         entries = data.get("ark_jobs") if isinstance(data, dict) else None
-        if not isinstance(entries, list) or not all(isinstance(entry, dict) and entry.get("id") for entry in entries):
+        reported = (data.get("reported") or {}) if isinstance(data, dict) else None    # missing in journals before 0.3.0
+        if not isinstance(entries, list) or not all(isinstance(entry, dict) and entry.get("id") for entry in entries) \
+                or not isinstance(reported, dict) or not all(isinstance(clips, dict) and all(isinstance(files, list)
+                                                                 for files in clips.values()) for clips in reported.values()):
             raise RuntimeError(f"Journal {self.path} hat ein unbekanntes Format. Datei prüfen.")
-        self.entries = {entry["id"]: entry for entry in entries}
+        self.entries, self.reported = {entry["id"]: entry for entry in entries}, reported
         return entries
 
     def put(self, job: _ArkJob) -> None:
@@ -403,12 +417,21 @@ class _Journal:
         if [self.entries.pop(jid) for jid in jids if jid in self.entries]:
             self._save()
 
+    def report(self, key: str, clips: dict[str, list[dict]]) -> None:
+        self.reported.setdefault(key, {}).update(clips)
+        self._save()
+
+    def forget(self, keys: Iterable[str]) -> None:
+        if [self.reported.pop(key) for key in list(keys) if key in self.reported]:
+            self._save()
+
     def session_ids(self) -> set[str]:
         return {entry["session_id"] for entry in self.entries.values() if entry.get("session_id")}
 
     def _save(self) -> None:
         temporary = self.path.with_name(f"{self.path.name}.tmp")
-        text = json.dumps({"app_version": app_version, "ark_jobs": list(self.entries.values())}, ensure_ascii=False, indent=1)
+        text = json.dumps({"app_version": app_version, "ark_jobs": list(self.entries.values()), "reported": self.reported},
+                          ensure_ascii=False, indent=1)
         temporary.write_text(text, encoding="utf-8")
         os.replace(temporary, self.path)
 
@@ -416,8 +439,9 @@ class _Journal:
 # --------- FUNC RUNNER ---------
 class _Runner:
     def __init__(self, jobs, on_result, on_log, on_status, cred_path, journal_path, poll_seconds, max_ark_queue,
-                 stall_minutes, reserve_gb) -> None:
+                 stall_minutes, reserve_gb, on_clip=None) -> None:
         self.jobs, self.on_result, self.log, self.on_status = iter(jobs), on_result, on_log, on_status
+        self.on_clip = on_clip
         self.cred_path, self.poll_seconds, self.max_ark_queue = cred_path, poll_seconds, max_ark_queue
         self.stall_seconds, self.reserve = stall_minutes * 60, int(reserve_gb * 1e9)
         self.journal = _Journal(journal_path)
@@ -453,6 +477,7 @@ class _Runner:
                 self._read_notifications()
                 self._check_alerts()
                 self._send(active)
+            self._report_clips()
             self._finish_tasks()
             self.on_status(self._status_lines())
             if self.exhausted and not self.tasks and not self.ark_list:
@@ -480,9 +505,11 @@ class _Runner:
             raise RuntimeError(f"Journal {self.journal.path} hat einen ungültigen Eintrag ({exc}). Datei prüfen.") from exc
         self.held = jobs
         self.ark_list += [job for job in jobs if job.state != "done"]
-        self.resume = bool(jobs)
+        self.resume = bool(jobs or self.journal.reported)
         if jobs:
             self.log(f"Journal: {len(jobs)} Ark-Jobs übernommen, davon {sum(job.state != 'done' for job in jobs)} offen.")
+        if clips := sum(map(len, self.journal.reported.values())):
+            self.log(f"Journal: {clips} schon gemeldete Clips aus {len(self.journal.reported)} Restorer-Jobs übernommen.")
 
     def _take_resumed(self) -> None:
         """Accept every order whose key is in the journal, regardless of the control; another order ends the phase."""
@@ -491,7 +518,7 @@ class _Runner:
             if job is None:
                 self._end_resume()
                 return
-            resumed = any(held.key == job.key for held in self.held)
+            resumed = job.key in self.journal.reported or any(held.key == job.key for held in self.held)
             self._accept(job)
             if not resumed:
                 self._end_resume()
@@ -505,6 +532,9 @@ class _Runner:
                 self.log(f"Ark-Job {job.short} ({job.key}) ohne Restorer-Job beendet, aus dem Journal entfernt.")
             else:
                 self.log(f"Ark-Job {job.short} ({job.key}) läuft ohne Restorer-Job weiter und wird bis zum Ende verfolgt.")
+        if gone := [key for key in self.journal.reported if key not in self.tasks]:
+            self.journal.forget(gone)
+            self.log(f"Gemeldete Clips von {', '.join(gone)} ohne Restorer-Job aus dem Journal entfernt.")
 
     def _next_order(self) -> RestorerJob | None:
         if self.exhausted:
@@ -546,6 +576,7 @@ class _Runner:
         if not isinstance(job.items, list) or not job.items:
             return "INVALID_INPUT", "items fehlt oder ist leer"
         task.entries = [{"item": item if isinstance(item, dict) else {}, "file": None, "reason": None} for item in job.items]
+        self._take_reported(task)
         try:
             task.share_root, share, rest = _split_target(job.output_folder)
         except ValueError as exc:
@@ -567,6 +598,8 @@ class _Runner:
                 entry["reason"] = _reason("INVALID_INPUT", f"clip_name ergibt keinen Ordnernamen: {item['clip_name']!r}")
                 continue
             entry["folder"] = folder
+            if entry.get("result"):
+                continue
             by_target.setdefault(f"{folder}/{item['file']}".casefold(), []).append(entry)
         for entries in by_target.values():
             first = entries[0]["item"]
@@ -580,6 +613,20 @@ class _Runner:
             for entry in entries:
                 entry["file"] = f
         return "", None
+
+    def _take_reported(self, task: _Task) -> None:
+        """Clips handed to on_clip before a restart keep that result; their files are not requested again."""
+        stored = self.journal.reported.get(task.job.key) or {}
+        clips: dict[str, list[dict]] = {}
+        for entry in task.entries:
+            clips.setdefault(entry["item"].get("clip_id"), []).append(entry)
+        for clip_id, files in stored.items():
+            if len(entries := clips.get(clip_id) or []) == len(files):
+                for entry, result in zip(entries, files):
+                    entry["result"] = result
+                task.reported.add(clip_id)
+        if task.reported:
+            self.log(f"Restorer-Job {task.job.key}: {len(task.reported)} Clips schon gemeldet, ihre Ordner bleiben unverändert.")
 
     def _mediaspace(self, share: str) -> str:
         loaded, names = self.mediaspaces
@@ -690,7 +737,13 @@ class _Runner:
         while free > 0 and (job := self._next_job()):
             if job.attempt > 1:
                 self._delete_partials(job)
-            if problem := self._space_problem(job, active):
+            if (problem := self._space_problem(job, active)) and problem.startswith("NO_SPACE"):
+                self._wait_for_space(job, problem)
+                break   # No overtaking: the next Ark job would take the space this one waits for.
+            if job.space_wait:
+                self.log(f"Ark-Job für {job.key}: Speicherplatz reicht wieder.")
+                job.space_wait = None
+            if problem:
                 self._fail(job, job.files, problem)
                 job.state = "done"
                 self.ark_list.remove(job)
@@ -721,15 +774,35 @@ class _Runner:
         need = sum(f.size for f in job.files) + self.reserve
         if free - own - foreign >= need:
             return None
-        return _reason("NO_SPACE", f"frei {_gb(free)}, ausstehend {_gb(own + foreign)} (davon fremd {_gb(foreign)}), "
-                                   f"nötig {_gb(need)} inkl. Reserve")
+        return _reason("NO_SPACE", f"es fehlen {_gb(need - (free - own - foreign))}; frei {_gb(free)}, ausstehend "
+                                   f"{_gb(own + foreign)} (davon fremd {_gb(foreign)}), nötig {_gb(need)} inkl. Reserve")
+
+    def _wait_for_space(self, job: _ArkJob, problem: str) -> None:
+        """Keep the Ark job first in line; the space check is repeated at every poll."""
+        if not job.space_wait:
+            self.log(f"Ark-Job für {job.key} wartet auf Speicherplatz: {problem.split(': ', 1)[1]}")
+        job.space_wait = problem.split(": ", 1)[1].split(";")[0]
+        self.retry_queue.appendleft(job)
+
+    def _busy_tapes(self) -> set[str]:
+        """Tapes of own Ark jobs that are being created, searched for, waiting or running in Ark."""
+        return {tape for job in self.ark_list if job.state in ("creating", "lost", "active") for tape in job.tape_set()}
 
     def _next_job(self) -> _ArkJob | None:
+        """Next Ark job to send; jobs on a tape of another own Ark job wait, later jobs on free tapes go first."""
         while True:
+            busy = self._busy_tapes()
             for pending in (self.retry_queue, self.group_queue):
-                while pending:
-                    job = pending.popleft()
-                    if self._still_needed(job):
+                for job in list(pending):
+                    if not self._still_needed(job):
+                        pending.remove(job)
+                    elif blocked := [tape for tape in job.tape_list() if tape.casefold() in busy]:
+                        if not job.tape_wait:
+                            self.log(f"Ark-Job für {job.key} wartet auf Band {', '.join(blocked)}: eigener Ark-Job auf demselben Band.")
+                        job.tape_wait = True
+                    else:
+                        pending.remove(job)
+                        job.tape_wait = False
                         return job
             if (order := self._next_order()) is None:
                 return None
@@ -982,8 +1055,11 @@ class _Runner:
             self._halve(job, missing, job.stop_reason)
         elif "cancel" in status:
             self._fail(job, missing, _reason("CANCELLED", job=job))
+        elif "insufficient space" in status and "NO_SPACE" not in job.resent:
+            self.log(f"Ark-Job {job.short} ({job.key}): Ark meldet {job.ark_status}; neuer Ark-Job wartet auf Speicherplatz.")
+            self._requeue(job, missing, resent={"NO_SPACE"})
         elif "insufficient space" in status:
-            self._fail(job, missing, _reason("NO_SPACE", f"Ark meldet {job.ark_status}", job))
+            self._fail(job, missing, _reason("NO_SPACE", f"Ark meldet {job.ark_status} (auch nach Warten auf Speicherplatz)", job))
         elif status == "complete":
             self._halve(job, missing, _reason("INCOMPLETE", "Ark meldet Complete, Datei fehlt oder Größe falsch", job))
         else:
@@ -1149,6 +1225,30 @@ class _Runner:
                 self._stop(job, "TAPES_OFFLINE", f"Band {', '.join(hits)} fehlt in der Library ({_cut(entry.get('msg'), 100)})", "Benachrichtigung")
 
     # --------- results and status ---------
+    def _report_clips(self) -> None:
+        """Hand every clip whose entries are all finished to on_clip, once per clip; its folder is not touched again."""
+        if self.on_clip is None:
+            return
+        for task in self.tasks.values():
+            if task.problem:
+                continue  # The whole order is reported at once.
+            clips: dict[str, list[dict]] = {}
+            for entry in task.entries:
+                if isinstance(clip_id := entry["item"].get("clip_id"), str) and clip_id.strip():
+                    clips.setdefault(clip_id, []).append(entry)
+            ready = {clip_id: [_file_result(entry) for entry in entries] for clip_id, entries in clips.items()
+                     if clip_id not in task.reported
+                     and all(entry["reason"] or (entry["file"] and entry["file"].state != "open") for entry in entries)}
+            if not ready:
+                continue
+            task.reported.update(ready)
+            self.journal.report(task.job.key, ready)    # before on_clip: after a restart these folders stay untouched
+            for clip_id, files in ready.items():
+                try:
+                    self.on_clip(task.job, files)
+                except Exception as exc:  # A failing partial report must not stop the restorer; the final result follows.
+                    self.log(f"Teilbericht für Clip {clip_id} ({task.job.key}) nicht gemeldet: {exc}")
+
     def _finish_tasks(self) -> None:
         for key, task in list(self.tasks.items()):
             if any(job.state != "done" for job in task.ark_jobs):
@@ -1161,16 +1261,11 @@ class _Runner:
             self.log(f"Restorer-Job {key}: {result.state} - {result.summary}")
             self.on_result(task.job, result)
             self.journal.remove(job.jid for job in task.ark_jobs)
+            self.journal.forget([key])
             del self.tasks[key]
 
     def _result(self, task: _Task) -> RestorerResult:
-        files = []
-        for entry in task.entries:
-            f = entry["file"]
-            restored = f is not None and f.state == "restored"
-            reason = None if restored else entry["reason"] or (f.reason if f else None) or _reason("INVALID_INPUT")
-            files.append({**{name: entry["item"].get(name) for name in item_fields}, "state": "restored" if restored else "failed",
-                          "reason": reason, "path": str(f.target) if restored else None})
+        files = [_file_result(entry) for entry in task.entries]
         ark_jobs = [{"session_id": job.session_id, "tapes": job.tapes, "hashes": [f.flow_hash for f in job.files],
                      "ark_status": job.ark_status or job.status or None, "start": job.start.isoformat() if job.start else None,
                      "duration": round((job.end - job.start).total_seconds()) if job.end and job.start else None,
@@ -1186,13 +1281,29 @@ class _Runner:
         return RestorerResult(task.job.key, state, summary, files, ark_jobs, versions())
 
     def _status_lines(self) -> list[str]:
-        lines = []
+        lines, busy = [], self._busy_tapes()
         for job in self.ark_list:
             status = pending_states.get(job.state) or job.status or "?"
+            blocked = [tape for tape in job.tape_list() if tape.casefold() in busy] if job.state == "pending" else []
+            if job.state == "pending" and job.space_wait:
+                status = f"wartet auf Speicherplatz ({job.space_wait})"
+            elif blocked:
+                status = f"wartet auf Band {', '.join(blocked)}"
             status += f" (Stopp {job.stop_code})" if job.stop_code else ""
             lines.append(f"{job.short:<18} {job.tapes:<10} {job.key}  {status}  {job.progress or '–'}  "
                          f"{job.remaining or '–'}  Versuch {job.attempt}")
         return lines or ["Keine Ark-Jobs"]
+
+
+def _file_result(entry: dict) -> dict:
+    """Result of one order entry: the item fields plus state, reason and full path."""
+    if entry.get("result"):
+        return entry["result"]
+    f = entry["file"]
+    restored = f is not None and f.state == "restored"
+    reason = None if restored else entry["reason"] or (f.reason if f else None) or _reason("INVALID_INPUT")
+    return {**{name: entry["item"].get(name) for name in item_fields}, "state": "restored" if restored else "failed",
+            "reason": reason, "path": str(f.target) if restored else None}
 
 
 def _connect(cred_path: Path):
@@ -1213,6 +1324,7 @@ def versions() -> dict[str, str]:
 
 def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, RestorerResult], object], *,
         on_log: Callable[[str], object] | None = None, on_status: Callable[[list[str]], object] | None = None,
+        on_clip: Callable[[RestorerJob, list[dict]], object] | None = None,
         cred_path: str | Path | None = None, journal_path: str | Path | None = None, log_path: str | Path | None = None,
         poll_seconds: float = 10, max_ark_queue: int = 0, stall_minutes: float = 60, reserve_gb: float = 50) -> None:
     """Restore the files of all jobs from LTO tape via Ark; returns when jobs is exhausted and all Ark jobs ended.
@@ -1220,12 +1332,16 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
     jobs: list or generator of RestorerJob; a generator yields None while no order is available.
     on_result(job, result) is called once per finished order; run() collects and returns nothing.
     on_log(message) gets event lines, on_status(lines) the status block (one line per Ark job) at every poll.
+    on_clip(job, files) is called once per clip as soon as all its entries are finished (files as in RestorerResult);
+    the restorer does not change that clip folder afterwards, also not after a restart (the journal keeps such clips).
     max_ark_queue: 0 sends new Ark jobs at once, n >= 1 sends while fewer than n Ark jobs wait in Ark.
     Ctrl+C stops the restorer, not the Ark jobs; the next start resumes them from the journal.
     Raises ValueError for invalid parameters, FileNotFoundError/RuntimeError if Ark or the journal are not usable.
     """
     if not callable(on_result):
         raise ValueError("on_result ist Pflicht und muss aufrufbar sein.")
+    if on_clip is not None and not callable(on_clip):
+        raise ValueError("on_clip muss aufrufbar sein.")
     numbers = {"poll_seconds": poll_seconds, "stall_minutes": stall_minutes}
     if bad := [name for name, value in numbers.items() if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0]:
         raise ValueError(f"{', '.join(bad)} muss eine Zahl > 0 sein.")
@@ -1236,7 +1352,7 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
     console = _Console(Path(log_path or default_log_path)) if on_log is None or on_status is None else None
     on_log, on_status = on_log or console.log, on_status or console.status
     runner = _Runner(jobs, on_result, on_log, on_status, Path(cred_path or default_cred_path),
-                     Path(journal_path or default_journal_path), poll_seconds, max_ark_queue, stall_minutes, reserve_gb)
+                     Path(journal_path or default_journal_path), poll_seconds, max_ark_queue, stall_minutes, reserve_gb, on_clip)
     try:
         runner.loop()
     except KeyboardInterrupt:

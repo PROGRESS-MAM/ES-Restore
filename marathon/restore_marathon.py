@@ -10,7 +10,7 @@ import restorer
 
 # --------- CONFIG ---------
 app_name = "Restore Marathon"
-app_version = "0.1.1"
+app_version = "0.2.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -73,21 +73,31 @@ def _orders():
         yield restorer.RestorerJob(job["job_id"], job.get("items"), claimed.output_folder)
 
 
-def _on_result(job: restorer.RestorerJob, result: restorer.RestorerResult) -> None:
+def _items(files: list[dict]) -> list[dict]:
+    """Report entries of restorer results: path relative to root_path, reason cut to reason_max_chars."""
     items = []
-    for f in result.files:
+    for f in files:
         path = _relative(f["path"]) if f["state"] == "restored" else None
         restored = path is not None
         reason = None if restored else f["reason"] or "Pfad außerhalb von root_path"
         items.append({"clip_id": f["clip_id"], "flow_hash": f["flow_hash"], "status": "restored" if restored else "failed",
                       "path": path, "reason": reason if reason is None or len(reason) <= reason_max_chars else f"{reason[:reason_max_chars - 1]}…"})
+    return items
+
+
+def _on_clip(job: restorer.RestorerJob, files: list[dict]) -> None:
+    adapter.report_items(job.key, _items(files))
+
+
+def _on_result(job: restorer.RestorerJob, result: restorer.RestorerResult) -> None:
+    items = _items(result.files)
     status = "ok" if items and all(item["status"] == "restored" for item in items) else "failed"
     adapter.report(job.key, adapter.JobReport(status=status, result=result.summary, preset=None, items=items))
 
 
 def work() -> None:
     restorer.run(_orders(), _on_result, on_log=lambda message: adapter.log(_short(message)),
-                 on_status=lambda lines: adapter.status(_short("\n".join(lines))), cred_path=cred_path,
+                 on_status=lambda lines: adapter.status(_short("\n".join(lines))), on_clip=_on_clip, cred_path=cred_path,
                  journal_path=journal_path, poll_seconds=poll_seconds, max_ark_queue=max_ark_queue,
                  stall_minutes=stall_minutes, reserve_gb=reserve_gb)
 
