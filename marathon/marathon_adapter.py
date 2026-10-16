@@ -7,7 +7,7 @@
 
 # --------- IMPORTS ---------
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 import ctypes
@@ -25,11 +25,12 @@ from toolbox import tb_write_log
 
 # --------- CONFIG ---------
 app_name = "Marathon Adapter"
-app_version = "1.2.0"
+app_version = "1.3.0"
 
 schema_versions = (6,)                      # job schema versions this adapter understands
 stage_folders = {"Restore": "restore", "Transcode": "transcode", "QC": "qc"}
 report_statuses = ("ok", "failed", "rejected")
+item_statuses = ("restored", "failed")      # status of one entry in items
 worker_dir = "worker"
 stale_seconds = 600                         # an older heartbeat of the own name is left over from a crash
 write_tries, write_pause = 3, 0.5           # Marathon may read a file while it is replaced
@@ -84,6 +85,8 @@ _settings: Settings | None = None
 _pool: "_Pool | None" = None
 _log_lock = threading.Lock()
 _block_lines = _block_width = 0             # running status block in the console, 0 lines if none
+_last_stamp = datetime.min.replace(tzinfo=timezone.utc)
+_stamp_lock = threading.Lock()
 
 
 # --------- FUNC CONSOLE ---------
@@ -168,6 +171,15 @@ def share_path(path: str) -> Path:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def _stamp() -> str:
+    """Strictly increasing UTC stamp YYYYMMDDTHHMMSSffffff for partial report names."""
+    global _last_stamp
+    with _stamp_lock:
+        # The clock may repeat for about 15 ms on Windows; two partial reports must never get the same name.
+        _last_stamp = max(datetime.now(timezone.utc), _last_stamp + timedelta(microseconds=1))
+        return _last_stamp.strftime("%Y%m%dT%H%M%S%f")
 
 
 def _duration(seconds: float) -> str:
@@ -294,19 +306,42 @@ def _checked(report: JobReport) -> JobReport:
     return report
 
 
+def _write_until_done(path: Path, data: dict, label: str) -> None:
+    """Write a JSON file into the report folder; keeps trying while the share is unavailable."""
+    while True:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write_json(path, data)
+            return
+        except OSError as exc:
+            log(f"{label} nicht schreibbar, neuer Versuch in {_settings.poll_seconds} s: {exc}")
+            time.sleep(_settings.poll_seconds)
+
+
 def _write_report(folder: Path, job_id: str, report: JobReport, name: str) -> None:
     """Write the report; keeps trying while the share is unavailable, no new job is taken meanwhile."""
     data = {"job_id": job_id, "status": report.status, "result": str(report.result or ""), "preset": report.preset,
             **{key: value for key, value in (("items", report.items), ("new_master", report.new_master)) if value is not None},
             "worker": name, "versions": _settings.versions}
-    while True:
-        try:
-            folder.mkdir(parents=True, exist_ok=True)
-            _write_json(folder / f"{job_id}.json", data)
-            return
-        except OSError as exc:
-            log(f"Report {job_id} nicht schreibbar, neuer Versuch in {_settings.poll_seconds} s: {exc}")
-            time.sleep(_settings.poll_seconds)
+    _write_until_done(folder / f"{job_id}.json", data, f"Report {job_id}")
+
+
+def _items_problem(items) -> str | None:
+    """Reason why items cannot go into a partial report; None if they can."""
+    if not isinstance(items, list) or not items:
+        return "items ist leer oder keine Liste"
+    for number, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            return f"Eintrag {number} ist kein Objekt"
+        if not isinstance(item.get("clip_id"), str) or not isinstance(item.get("flow_hash"), str):
+            return f"Eintrag {number}: clip_id oder flow_hash fehlt oder ist kein Text"
+        if item.get("status") not in item_statuses:
+            return f"Eintrag {number}: status {item.get('status')!r} statt {' oder '.join(item_statuses)}"
+    try:
+        json.dumps(items)
+    except (TypeError, ValueError) as exc:
+        return f"items nicht als JSON schreibbar: {exc}"
+    return None
 
 
 def _claim_file(offen: Path, own: Path) -> Path | None:
@@ -390,6 +425,16 @@ class _Pool:
                 return ClaimedJob(job, output)
             return None
 
+    def report_items(self, job_id: str, items: list[dict]) -> None:
+        with self.lock:
+            if job_id not in self.jobs:
+                raise ValueError(f"Job {job_id!r} wurde nicht mit claim() übernommen oder ist schon gemeldet.")
+            if problem := _items_problem(items):
+                raise ValueError(f"Teilbericht für Job {job_id}: {problem}")
+            path = _report_folder(self.jobs[job_id][0], self.reports) / f"{job_id}.teil-{_stamp()}.json"
+            _write_until_done(path, {"job_id": job_id, "items": items}, f"Teilbericht {job_id}")
+            log(f"Teilbericht {job_id}: {len(items)} Einträge")
+
     def report(self, job_id: str, report: JobReport) -> None:
         with self.lock:
             if job_id not in self.jobs:
@@ -421,8 +466,20 @@ def report(job_id: str, job_report: JobReport) -> None:
     _pool.report(job_id, job_report)
 
 
+def report_items(job_id: str, items: list[dict]) -> None:
+    """Write a partial report <report_folder>/<job_id>.teil-<stamp>.json with finished items of a claimed job.
+
+    items as in the report: objects with at least clip_id, flow_hash and status ("restored" | "failed"). Only inside
+    run_stream; the heartbeat stays unchanged. Raises ValueError if job_id was not claimed or is already reported, or if
+    items is empty or invalid.
+    """
+    if _pool is None:
+        raise RuntimeError("report_items() nur innerhalb von run_stream verfügbar.")
+    _pool.report_items(job_id, items)
+
+
 def run_stream(settings: Settings, work: Callable[[], object]) -> None:
-    """Start the worker of settings.stage and call work(); work uses claim() and report() until Ctrl+C.
+    """Start the worker of settings.stage and call work(); work uses claim(), report_items() and report() until Ctrl+C.
 
     Returns when work() returns. Jobs without report stay in laufend/<worker>/ for the next start.
     Raises ValueError or RuntimeError if the settings or the pool folders are not usable; exceptions of work() pass.
