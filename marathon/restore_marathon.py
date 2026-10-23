@@ -10,7 +10,7 @@ import restorer
 
 # --------- CONFIG ---------
 app_name = "Restore Marathon"
-app_version = "0.2.0"
+app_version = "0.2.1"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -20,7 +20,7 @@ poll_seconds = 10
 heartbeat_seconds = 30
 max_ark_queue = 1
 stall_minutes = 60
-reserve_gb = 500
+reserve_gb = 2000
 
 
 # --------- STATIC ---------
