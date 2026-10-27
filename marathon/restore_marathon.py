@@ -10,7 +10,7 @@ import restorer
 
 # --------- CONFIG ---------
 app_name = "Restore Marathon"
-app_version = "0.2.1"
+app_version = "0.3.0"
 
 root_path = Path(r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit")   # like root_path in Marathon's res/config.ini
 work_dir = ".marathon"                      # like work_dir in Marathon's res/config.ini
@@ -22,6 +22,7 @@ max_ark_queue = 1
 stall_minutes = 60
 reserve_gb = 2000
 max_files_per_ark_job = 50
+finish_wait_minutes = 5
 
 
 # --------- STATIC ---------
@@ -41,6 +42,7 @@ def _run_folder() -> Path:
 cred_path = _bundle_folder() / "marathon" / "cred.env"
 main_log = _run_folder() / "restore_marathon.log"
 journal_path = _run_folder() / "restore_marathon.journal.json"
+blocked_tapes_path = _run_folder() / "blocked_tapes.txt"
 # root_path up to work_dir, with "\" or "/" as separator, is cut from console and log lines
 root_parts = [*PureWindowsPath(root_path).drive.lstrip("\\").split("\\"), *PureWindowsPath(root_path).parts[1:]]
 short_prefix = re.compile(r"(?:\\\\|//)" + r"[\\/]".join(map(re.escape, root_parts))
@@ -101,7 +103,8 @@ def work() -> None:
                  on_status=lambda lines: adapter.status(_short("\n".join(lines))), on_clip=_on_clip, cred_path=cred_path,
                  journal_path=journal_path, poll_seconds=poll_seconds, max_ark_queue=max_ark_queue,
                  stall_minutes=stall_minutes, reserve_gb=reserve_gb,
-                 max_files_per_ark_job=max_files_per_ark_job)
+                 max_files_per_ark_job=max_files_per_ark_job, blocked_tapes_path=blocked_tapes_path,
+                 finish_wait_minutes=finish_wait_minutes)
 
 
 # --------- MAIN ---------

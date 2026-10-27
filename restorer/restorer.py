@@ -19,11 +19,12 @@ import uuid
 import ArkAPI
 import toolbox
 from toolbox import tb_link_api, tb_write_log
+from .tape_safety import _TapeSafety
 
 
 # --------- CONFIG ---------
 app_name = "ES-Restore"
-app_version = "0.3.0"
+app_version = "0.4.0"
 
 project_folder = Path(__file__).resolve().parents[1]   # installed: site-packages, callers pass their paths
 default_cred_path = project_folder / "cred.env"
@@ -31,8 +32,6 @@ default_journal_path = project_folder / "restorer.journal.json"
 default_log_path = project_folder / "restorer.log"
 
 ark_sources = ["tape"]
-lost_search_minutes = 15            # minimum search for an Ark job whose creation got no answer
-not_found_limit = 3                 # polls without hit before a new Ark job counts as orphaned
 restop_minutes = 5
 mediaspace_cache_minutes = 5
 clock_tolerance_seconds = 120       # Ark clock vs. local clock when matching a job without session id
@@ -55,6 +54,9 @@ reason_texts = {
     "CANCELLED": "Ark-Job in Ark von Hand abgebrochen",
     "TAPE_DEFECT": "Band meldet Medienfehler",
     "DRIVE_ERROR": "Laufwerk meldet Fehler",
+    "PREFLIGHT_BLOCKED": "Vorprüfung: Clip wegen gesperrtem Band zurückgestellt",
+    "PREFLIGHT_OFFLINE": "Vorprüfung: Bandkopie nicht vollständig in der Library",
+    "PREFLIGHT_INVALID": "Vorprüfung: Clip nicht restaurierbar",
 }
 stop_ranks = {code: rank for rank, code in enumerate(("STALLED", "ARK_ERROR", "DRIVE_ERROR", "TAPES_OFFLINE", "TAPE_DEFECT"))}
 item_fields = ("clip_id", "clip_name", "file", "flow_hash", "tape", "size")
@@ -118,6 +120,8 @@ class _Task:
     defect_tapes: set[str] = field(default_factory=set)
     reported: set[str] = field(default_factory=set)        # clip_ids already handed to on_clip
     problem: str | None = None
+    prepared: bool = False
+    precheck_waiting: bool = False
     mediaspace: str = ""
     share_root: str = ""
 
@@ -141,7 +145,6 @@ class _ArkJob:
     remaining: str = ""
     transferred: int = 0
     stall_since: float = field(default_factory=time.monotonic)
-    not_found: int = 0
     from_journal: bool = False
     stop_code: str | None = None
     stop_reason: str | None = None
@@ -155,6 +158,10 @@ class _ArkJob:
     decided: bool = False
     tape_wait: bool = False                 # waiting for a tape held by another own Ark job, logged once
     space_wait: str | None = None           # missing space while waiting to be sent
+    finish_since: datetime | None = None
+    finish_logged: bool = False
+    uncertain_logged: bool = False
+    unsafe_tapes: dict[str, str] = field(default_factory=dict)
 
     @property
     def short(self) -> str:
@@ -307,28 +314,19 @@ def _mediaspace_name(share: str, names: list[str]) -> str:
 
 
 def _plan_ark_files(files: list[_File], max_files_per_ark_job: int | None) -> list[list[_File]]:
-    groups: dict[tuple[str, ...], list[_File]] = {}
-    for index, file in enumerate(files):
-        if max_files_per_ark_job is None:
-            key = file.group
-        elif len(file.group) > 1:
-            key = ("spanning", str(index))
-        elif file.group:
-            key = ("tape", file.group[0].casefold())
-        else:
-            key = ("missing", str(index))
-        groups.setdefault(key, []).append(file)
-
+    groups: dict[str, list[_File]] = {}
     plans = []
-    for key, grouped_files in groups.items():
-        if max_files_per_ark_job is None:
-            plans.append(grouped_files)
-        elif key[0] != "tape":
-            plans.extend([[file] for file in grouped_files])
-        else:
-            for start in range(0, len(grouped_files), max_files_per_ark_job):
-                plans.append(grouped_files[start:start + max_files_per_ark_job])
-    return plans
+    for file in files:
+        if len(file.group) != 1:
+            plans.append([file])
+            continue
+        groups.setdefault(file.group[0].casefold(), []).append(file)
+    for grouped_files in groups.values():
+        limit = max_files_per_ark_job or len(grouped_files)
+        plans.extend(grouped_files[start:start + limit] for start in range(0, len(grouped_files), limit))
+    # Keep the first occurrence of each tape/file in the original order.
+    order = {id(file): index for index, file in enumerate(files)}
+    return sorted(plans, key=lambda plan: order[id(plan[0])])
 
 
 # --------- FUNC CONSOLE ---------
@@ -388,6 +386,7 @@ def _journal_entry(job: _ArkJob) -> dict:
         "stop_code": job.stop_code, "stop_reason": job.stop_reason, "resent": sorted(job.resent),
         "process_ids": sorted(job.process_ids), "ark_status": job.ark_status, "ark_text": job.ark_text,
         "decided": job.decided, "results": job.results,
+        "finish_since": job.finish_since.isoformat() if job.finish_since else None, "unsafe_tapes": job.unsafe_tapes,
         "files": [{"flow_hash": f.flow_hash, "restore_path": f.restore_path, "target": str(f.target), "size": f.size,
                    "tape": f.tape, "group": list(f.group), "copies": f.copies} for f in job.files],
     }
@@ -402,8 +401,9 @@ def _job_from_entry(entry: dict) -> _ArkJob:
                   stop_code=entry.get("stop_code"), stop_reason=entry.get("stop_reason"),
                   resent=set(entry.get("resent") or ()), process_ids=set(entry.get("process_ids") or ()),
                   ark_status=entry.get("ark_status") or "", ark_text=entry.get("ark_text") or "",
-                  results=dict(entry.get("results") or {}), decided=bool(entry.get("decided")))
-    job.state = "done" if entry.get("state") == "done" else "active" if job.session_id else "lost"
+                  results=dict(entry.get("results") or {}), decided=bool(entry.get("decided")),
+                  finish_since=_parse_date(entry.get("finish_since")), unsafe_tapes=dict(entry.get("unsafe_tapes") or {}))
+    job.state = "done" if entry.get("state") == "done" else "finishing" if entry.get("state") == "finishing" else "active" if job.session_id else "lost"
     job.start = _session_start(job.session_id)
     if job.stop_code:
         job.stop_sent = time.monotonic()
@@ -464,10 +464,15 @@ class _Journal:
 # --------- FUNC RUNNER ---------
 class _Runner:
     def __init__(self, jobs, on_result, on_log, on_status, cred_path, journal_path, poll_seconds, max_ark_queue,
-                 stall_minutes, reserve_gb, on_clip=None, max_files_per_ark_job=None) -> None:
+                 stall_minutes, reserve_gb, on_clip=None, max_files_per_ark_job=None, blocked_tapes_path=None,
+                 finish_wait_minutes=5) -> None:
         self.jobs, self.on_result, self.log, self.on_status = iter(jobs), on_result, on_log, on_status
         self.on_clip = on_clip
         self.max_files_per_ark_job = max_files_per_ark_job
+        self.safety = _TapeSafety(blocked_tapes_path)
+        self.started_at = datetime.now()
+        self.preflight_issue: str | None = None
+        self.finish_wait_seconds = finish_wait_minutes * 60
         self.cred_path, self.poll_seconds, self.max_ark_queue = cred_path, poll_seconds, max_ark_queue
         self.stall_seconds, self.reserve = stall_minutes * 60, int(reserve_gb * 1e9)
         self.journal = _Journal(journal_path)
@@ -502,7 +507,11 @@ class _Runner:
                 self._watch(active)
                 self._read_notifications()
                 self._check_alerts()
+                self._advance_tasks()
                 self._send(active)
+            for job in list(self.ark_list):
+                if job.state == "finishing":
+                    self._finish_targets(job)
             self._report_clips()
             self._finish_tasks()
             self.on_status(self._status_lines())
@@ -530,6 +539,9 @@ class _Runner:
         except (KeyError, TypeError, ValueError) as exc:
             raise RuntimeError(f"Journal {self.journal.path} hat einen ungültigen Eintrag ({exc}). Datei prüfen.") from exc
         self.held = jobs
+        for job in jobs:
+            for tape, reason in job.unsafe_tapes.items():
+                self._learn_tape(job, tape, reason)
         self.ark_list += [job for job in jobs if job.state != "done"]
         self.resume = bool(jobs or self.journal.reported)
         if jobs:
@@ -540,12 +552,16 @@ class _Runner:
     def _take_resumed(self) -> None:
         """Accept every order whose key is in the journal, regardless of the control; another order ends the phase."""
         while self.resume:
+            if any(not task.prepared for task in self.tasks.values()):
+                return
             job = self._next_order()
             if job is None:
                 self._end_resume()
                 return
             resumed = job.key in self.journal.reported or any(held.key == job.key for held in self.held)
             self._accept(job)
+            if not self.tasks[job.key].prepared:
+                return
             if not resumed:
                 self._end_resume()
 
@@ -581,22 +597,88 @@ class _Runner:
             return
         task = _Task(job)
         self.tasks[job.key] = task
+        self._prepare_task(task)
+
+    def _prepare_task(self, task: _Task) -> None:
         code, problem = self._prepare(task)
+        if code == "ARK_ERROR" and problem:
+            task.precheck_waiting = True
+            self._pause_preflight(problem)
+            return
+        task.prepared = True
         if problem:
             task.problem = _reason(code, problem)
             for entry in task.entries:
                 entry["reason"] = entry["reason"] or task.problem
-            self.log(f"Restorer-Job {job.key} abgelehnt: {task.problem}")
+            self.log(f"Restorer-Job {task.job.key} abgelehnt: {task.problem}")
             return
-        clips = len({entry["item"]["clip_id"] for entry in task.entries if entry.get("folder")})
-        self.log(f"Restorer-Job {job.key} angenommen: {len(task.entries)} Einträge, {clips} Clips, Ziel {job.output_folder} "
-                 f"(Media Space {task.mediaspace})")
+        self.log(f"Restorer-Job {task.job.key} angenommen: {len(task.entries)} Einträge, Ziel {task.job.output_folder}")
         self._attach(task)
         self._precheck(task)
+
+    def _advance_tasks(self) -> None:
+        for task in list(self.tasks.values()):
+            if not task.prepared:
+                self._prepare_task(task)
+            elif task.precheck_waiting:
+                self._precheck(task)
+
+    def _pause_preflight(self, message: str) -> None:
+        if self.preflight_issue != message:
+            self.log(f"Vorprüfung wartet: {message}; keine neuen Ark-Jobs. Laufende Jobs werden weiter überwacht.")
+        self.preflight_issue = message
+
+    def _read_blocked(self) -> set[str] | None:
+        try:
+            blocked = self.safety.read()
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._pause_preflight(f"Sperrdatei nicht verwendbar: {exc}")
+            return None
+        return blocked
+
+    def _learn_tape(self, job: _ArkJob, tape: str, reason: str) -> None:
+        try:
+            self.safety._key(tape)
+        except ValueError:
+            self.log(f"Bandsperre nicht übernommen: ungültige Bandkennung {tape!r}.")
+            return
+        job.unsafe_tapes[tape] = reason
+        self.journal.put(job)
+        try:
+            if self.safety.block(tape, reason):
+                destination = str(self.safety.path) if self.safety.path else "Sitzung (keine Sperrdatei konfiguriert)"
+                self.log(f"Band {tape} automatisch gesperrt: {reason}; {destination}.")
+        except (OSError, UnicodeError, ValueError) as exc:
+            self._pause_preflight(f"Bandsperre für {tape} noch nicht gespeichert: {exc}")
+
+    def _reject_unsafe_clips(self, task: _Task) -> None:
+        clips: dict[str, list[dict]] = {}
+        for entry in task.entries:
+            clip_id = entry["item"].get("clip_id")
+            if isinstance(clip_id, str) and clip_id not in task.reported:
+                clips.setdefault(clip_id, []).append(entry)
+        for entries in clips.values():
+            reason = next((entry["reason"] or (entry["file"].reason if entry["file"] else None)
+                           for entry in entries if entry["reason"] or
+                           (entry["file"] and entry["file"].state == "failed" and
+                            (entry["file"].reason or "").startswith("PREFLIGHT_"))), None)
+            if not reason:
+                continue
+            reason = reason if reason.startswith("PREFLIGHT_") else _reason("PREFLIGHT_INVALID", reason)
+            for entry in entries:
+                if entry.get("result"):
+                    continue
+                entry["reason"] = reason
+                file = entry["file"]
+                if file and file.state == "open" and not any(
+                        job.state in ("creating", "lost", "active", "finishing") and file in job.files
+                        for job in task.ark_jobs):
+                    file.state, file.reason = "failed", reason
 
     def _prepare(self, task: _Task) -> tuple[str, str | None]:
         """Validate the order and build its files; returns (reason code, problem of the whole order or None)."""
         job = task.job
+        task.files = []
         if not isinstance(job.key, str) or not job.key.strip():
             return "INVALID_INPUT", "key fehlt"
         if not isinstance(job.items, list) or not job.items:
@@ -611,7 +693,7 @@ class _Runner:
             task.mediaspace = self._mediaspace(share)
         except ValueError as exc:
             return "INVALID_INPUT", str(exc)
-        except RuntimeError as exc:
+        except (RuntimeError, OSError) as exc:
             return "ARK_ERROR", str(exc)
         folders, used, by_target = {}, set(), {}
         for entry, item in zip(task.entries, job.items):
@@ -660,7 +742,11 @@ class _Runner:
             result = self.ark.get_mediaspaces()
             if not _ok(result):
                 raise RuntimeError(f"Media Spaces in Ark nicht lesbar: {result}")
+            if not isinstance(result.data, (list, dict)) or (isinstance(result.data, dict) and "esa_spaces" not in result.data):
+                raise RuntimeError("Media-Space-Auskunft von Ark ist unvollständig")
             spaces = _listed(result.data, "esa_spaces")
+            if not spaces or not all(isinstance(space, dict) and isinstance(space.get("name"), str) and space["name"] for space in spaces):
+                raise RuntimeError("Media-Space-Auskunft von Ark ist leer oder unvollständig")
             names = list(dict.fromkeys(str(space["name"]) for space in spaces if space.get("name")))
             self.mediaspaces = (time.monotonic(), names)
         return _mediaspace_name(share, names)
@@ -701,66 +787,88 @@ class _Runner:
 
     def _precheck(self, task: _Task) -> None:
         todo = [f for f in task.files if f.state == "open" and not f.covered]
-        for f in todo:
-            if _complete(f):
-                f.state = "restored"
+        for file in todo:
+            if _complete(file):
+                file.state = "restored"
         todo = [f for f in todo if f.state == "open"]
-        if todo:
-            todo = self._check_ark(todo)
-        plans = _plan_ark_files(todo, self.max_files_per_ark_job)
+        checked = self._check_ark(todo) if todo else []
+        if checked is None:
+            task.precheck_waiting = True
+            return
+        task.precheck_waiting = False
+        self._reject_unsafe_clips(task)
+        plans = _plan_ark_files([f for f in checked if f.state == "open"], self.max_files_per_ark_job)
         for files in plans:
             job = _ArkJob(task.job.key, files, task.mediaspace, task.share_root, task=task)
             task.ark_jobs.append(job)
             self.ark_list.append(job)
             self.group_queue.append(job)
-        states = Counter(f.state for f in task.files)
-        failed = sum(1 for entry in task.entries if entry["reason"]) + states["failed"]
-        tapes = ["+".join(dict.fromkeys(tape for f in files for tape in (f.group or (f.tape,)))) for files in plans]
-        self.log(f"Restorer-Job {task.job.key}: {states['restored']} Dateien schon vollständig, {failed} gescheitert, "
-                 f"{len(plans)} Ark-Jobs geplant" + (f" (Bänder {', '.join(tapes)})" if plans else ""))
+        self.log(f"Restorer-Job {task.job.key}: {len(plans)} kleine Ark-Jobs geplant, "
+                 f"{sum(bool(entry['reason']) for entry in task.entries)} Einträge wegen Vorprüfung zurückgestellt.")
 
-    def _check_ark(self, files: list[_File]) -> list[_File]:
-        def fail(f, code, text=None):
-            f.state, f.reason = "failed", _reason(code, text)
-        check = self.ark.check_restore([f.flow_hash for f in files])
-        if not _ok(check):
-            for f in files:
-                fail(f, "ARK_ERROR", f"Prüfung bei Ark gescheitert: {check}")
-            return []
-        infos = check.data.get("files") or {}
-        for f in files:
-            info = infos.get(f.flow_hash) or {}
-            copies = [list(copy) for copy in info.get("copies") or []]
-            if self.max_files_per_ark_job is None:
-                copy = next((copy for copy in copies if f.tape.casefold() in {tape.casefold() for tape in copy}), None)
-            else:
-                # Tape-only requests have no copy selector, so use Ark's first returned tape copy.
-                copy = next((copy for copy in copies if copy), None)
+    def _check_ark(self, files: list[_File]) -> list[_File] | None:
+        blocked = self._read_blocked()
+        if blocked is None:
+            return None
+        try:
+            check = self.ark.check_restore([f.flow_hash for f in files])
+        except (OSError, TimeoutError) as exc:
+            self._pause_preflight(f"Datei-Auskunft von Ark nicht erreichbar: {exc}")
+            return None
+        infos = check.data.get("files") if _ok(check) and isinstance(check.data, dict) else None
+        if not isinstance(infos, dict):
+            self._pause_preflight("Datei-Auskunft von Ark nicht erreichbar oder unvollständig")
+            return None
+        # Validate the complete answer before mutating file states.
+        for file in files:
+            info = infos.get(file.flow_hash)
+            if not isinstance(info, dict) or (info.get("reason") != "INVALID_HASH" and type(info.get("in_ark")) is not bool):
+                self._pause_preflight(f"Datei-Auskunft für {file.flow_hash} unvollständig")
+                return None
+            copies = info.get("copies")
+            if info.get("in_ark") and (not isinstance(copies, list) or not all(
+                    isinstance(copy, list) and all(isinstance(tape, str) and tape.strip() for tape in copy)
+                    for copy in copies)):
+                self._pause_preflight(f"Bandkopien für {file.flow_hash} unvollständig")
+                return None
+        def fail(file, code, text):
+            file.state, file.reason = "failed", _reason(code, text)
+        for file in files:
+            info = infos[file.flow_hash]
             if info.get("reason") == "INVALID_HASH":
-                fail(f, "INVALID_INPUT", "Ark lehnt den Hash ab")
-            elif not info.get("in_ark"):
-                fail(f, "NOT_IN_ARK")
-            elif copy is None:
-                message = (f"Band {f.tape} nicht unter Arks Kopien ({', '.join('+'.join(c) or 'Disk' for c in copies)})"
-                           if self.max_files_per_ark_job is None else
-                           f"Keine auswählbare Bandkopie in Ark ({', '.join('+'.join(c) or 'Disk' for c in copies)})")
-                fail(f, "TAPE_MISMATCH", message)
-            elif self.max_files_per_ark_job is None:
-                f.copies, f.group = copies, tuple(sorted(copy, key=str.casefold))
+                fail(file, "PREFLIGHT_INVALID", "Vorprüfung: Ark lehnt den Hash ab")
+            elif not info["in_ark"]:
+                fail(file, "PREFLIGHT_INVALID", "Vorprüfung: Datei nicht in Ark")
             else:
-                f.copies, f.group = copies, tuple(dict.fromkeys(str(tape) for tape in copy))
-        files = [f for f in files if f.state == "open"]
-        tapes = list(dict.fromkeys(tape for f in files for tape in f.group))
-        if not tapes:
-            return files
-        location = self.ark.get_tape_location(tapes)
-        if not _ok(location):
-            for f in files:
-                fail(f, "ARK_ERROR", f"Bandort in Ark nicht lesbar: {location}")
-            return []
-        for f in files:
-            if offline := [tape for tape in f.group if not (location.data.get(tape) or {}).get("in_changer")]:
-                fail(f, "TAPES_OFFLINE", f"Band {', '.join(offline)} nicht in der Library")
+                file.copies = info["copies"]
+                copy = next((copy for copy in file.copies if copy), None)
+                if copy is None:
+                    fail(file, "PREFLIGHT_INVALID", "Vorprüfung: keine Bandkopie in Ark")
+                    continue
+                file.group = tuple({tape.casefold(): tape for tape in copy}.values())
+                hits = sorted({tape for copy in file.copies for tape in copy if tape.casefold() in blocked})
+                if hits:
+                    fail(file, "PREFLIGHT_BLOCKED", f"Vorprüfung: gesperrte Bandkopie auf {', '.join(hits)}")
+        remaining = [f for f in files if f.state == "open"]
+        tapes = list(dict.fromkeys(tape for file in remaining for copy in file.copies for tape in copy))
+        if tapes:
+            try:
+                location = self.ark.get_tape_location(tapes)
+            except (OSError, TimeoutError) as exc:
+                self._pause_preflight(f"Library-Auskunft von Ark nicht erreichbar: {exc}")
+                return None
+            data = location.data if _ok(location) and isinstance(location.data, dict) else None
+            if not isinstance(data, dict) or any(not isinstance(data.get(tape), dict) or
+                    type(data[tape].get("in_changer")) is not bool for tape in tapes):
+                self._pause_preflight("Library-Auskunft von Ark nicht erreichbar oder unvollständig")
+                return None
+            for file in remaining:
+                offline = sorted({tape for copy in file.copies for tape in copy if not data[tape]["in_changer"]})
+                if offline:
+                    fail(file, "PREFLIGHT_OFFLINE", f"Vorprüfung: Bandkopie auf {', '.join(offline)} nicht in der Library")
+        if self.preflight_issue:
+            self.log("Vorprüfung wieder verfügbar.")
+        self.preflight_issue = None
         return [f for f in files if f.state == "open"]
 
     # --------- control and creation ---------
@@ -769,6 +877,15 @@ class _Runner:
         waiting += sum(job.state in ("creating", "lost") or (job.state == "active" and job.session_id not in active) for job in self.ark_list)
         free = math.inf if self.max_ark_queue == 0 else self.max_ark_queue - waiting
         while free > 0 and (job := self._next_job()):
+            ready = self._preflight_pending(job)
+            if ready is None:
+                self.retry_queue.appendleft(job)
+                break
+            if not ready:
+                continue
+            if job.tape_set() & self._busy_tapes():
+                self.group_queue.append(job)
+                continue
             if job.attempt > 1:
                 self._delete_partials(job)
             if (problem := self._space_problem(job, active)) and problem.startswith("NO_SPACE"):
@@ -795,7 +912,7 @@ class _Runner:
         space = job.mediaspace.casefold()
         own_ids = self.journal.session_ids() | {other.session_id for other in self.ark_list if other.session_id}
         own = sum(other.remaining_bytes() for other in self.ark_list
-                  if other is not job and other.state in ("creating", "lost", "active") and other.mediaspace.casefold() == space)
+                  if other is not job and other.state in ("creating", "lost", "active", "finishing") and other.mediaspace.casefold() == space)
         foreign = 0
         for session_id, entry in active.items():
             current = str(entry.get("current_space") or "").casefold()
@@ -820,7 +937,7 @@ class _Runner:
 
     def _busy_tapes(self) -> set[str]:
         """Tapes of own Ark jobs that are being created, searched for, waiting or running in Ark."""
-        return {tape for job in self.ark_list if job.state in ("creating", "lost", "active") for tape in job.tape_set()}
+        return {tape for job in self.ark_list if job.state in ("creating", "lost", "active", "finishing") for tape in job.tape_set()}
 
     def _next_job(self) -> _ArkJob | None:
         """Next Ark job to send; jobs on a tape of another own Ark job wait, later jobs on free tapes go first."""
@@ -841,17 +958,57 @@ class _Runner:
             if (order := self._next_order()) is None:
                 return None
             self._accept(order)
+            if self.tasks[order.key].precheck_waiting:
+                return None
 
     def _still_needed(self, job: _ArkJob) -> bool:
         job.files = [f for f in job.files if f.state == "open"]
-        if job.task and (defect := sorted({tape for f in job.files for tape in f.group} & job.task.defect_tapes)):
-            self._fail(job, job.files, _reason("TAPE_DEFECT", f"Band {', '.join(defect)} meldet Medienfehler (früherer Ark-Job)"))
-            job.files = []
         if job.files:
             return True
         job.state = "done"
         self.ark_list.remove(job)
         return False
+
+    def _preflight_pending(self, job: _ArkJob) -> bool | None:
+        blocked = self._read_blocked()
+        if blocked is None:
+            return None
+        task = job.task
+        if task:
+            for entry in task.entries:
+                file = entry["file"]
+                if not file or entry.get("result") or entry["item"].get("clip_id") in task.reported:
+                    continue
+                hits = sorted({tape for copy in file.copies for tape in copy if tape.casefold() in blocked})
+                if hits:
+                    entry["reason"] = _reason("PREFLIGHT_BLOCKED", f"Vorprüfung: gesperrte Bandkopie auf {', '.join(hits)}")
+            self._reject_unsafe_clips(task)
+        for file in job.files:
+            if file.state == "open" and _complete(file):
+                file.state = "restored"
+        job.files = [f for f in job.files if f.state == "open"]
+        if not job.files:
+            job.state = "done"
+            self.ark_list.remove(job)
+            return False
+        checked = self._check_ark(job.files)
+        if checked is None:
+            return None
+        if task:
+            self._reject_unsafe_clips(task)
+        job.files = [f for f in checked if f.state == "open"]
+        if not job.files:
+            job.state = "done"
+            self.ark_list.remove(job)
+            return False
+        plans = _plan_ark_files(job.files, self.max_files_per_ark_job)
+        if len(plans) > 1:
+            job.state = "done"
+            self.ark_list.remove(job)
+            for files in reversed(plans):
+                self._requeue(job, files, attempt=job.attempt, front=True)
+            return False
+        return True
 
     def _delete_partials(self, job: _ArkJob) -> None:
         for f in job.files:
@@ -891,10 +1048,11 @@ class _Runner:
                 return
             if isinstance(result, ValueError):
                 self._drop_created(job, _reason("ARK_ERROR", f"Restore nicht angelegt: {result}"))
-            elif isinstance(result, Exception) or result.code == 0 or (_ok(result) and not (result.data or {}).get("session_id")):
+            elif isinstance(result, Exception) or result.code == 0 or result.code == 408 or result.code >= 500 or (_ok(result) and
+                    (not isinstance(result.data, dict) or not isinstance(result.data.get("session_id"), str) or not result.data["session_id"])):
                 job.state = "lost"
                 self.journal.put(job)
-                self.log(f"Ark-Job für {job.key}: keine Antwort beim Anlegen ({result}); suche ihn mindestens {lost_search_minutes} min.")
+                self.log(f"Ark-Job für {job.key}: keine eindeutige Antwort beim Anlegen ({result}); weiter suchen, keine automatische Neusendung.")
             elif _ok(result):
                 job.state, job.session_id = "active", result.data["session_id"]
                 job.start = _session_start(job.session_id) or datetime.now()
@@ -904,17 +1062,18 @@ class _Runner:
                          f"{job.mediaspace}/{job.files[0].restore_path.rsplit('/', 2)[0]}")
             elif result.error == "HASHES_NOT_RESTORABLE":
                 skipped = (result.data or {}).get("skipped") or {}
-                codes = {"INVALID_HASH": "INVALID_INPUT", "NOT_IN_ARK": "NOT_IN_ARK"}
+                codes = {"INVALID_HASH": "PREFLIGHT_INVALID", "NOT_IN_ARK": "PREFLIGHT_INVALID"}
                 for f in job.files:
                     if info := skipped.get(f.flow_hash):
                         offline = ", ".join(info.get("tapes_offline") or [])
-                        code = codes.get(info.get("reason"), "TAPES_OFFLINE")
-                        self._fail(job, [f], _reason(code, f"Band {offline} nicht in der Library" if code == "TAPES_OFFLINE" and offline else None))
-                rest = [f for f in job.files if f.state == "open"]
-                if len(rest) == len(job.files):
+                        code = codes.get(info.get("reason"), "PREFLIGHT_OFFLINE")
+                        self._fail(job, [f], _reason(code, f"Band {offline} nicht in der Library" if code == "PREFLIGHT_OFFLINE" and offline else None))
+                if all(f.state == "open" for f in job.files):
                     self._drop_created(job, _reason("ARK_ERROR", f"Ark legt keinen Restore an: {_cut(result.message, ark_text_chars)}"))
                     continue
                 self._drop_created(job, None)
+                self._reject_unsafe_clips(job.task)
+                rest = [f for f in job.files if f.state == "open"]
                 if rest:
                     self._requeue(job, rest, attempt=job.attempt, front=True)
             else:
@@ -935,7 +1094,6 @@ class _Runner:
             if (entry := active.get(job.session_id)) is None:
                 self._check_gone(job)
             else:
-                job.not_found = 0
                 self._update(job, entry)
         if lost := [job for job in self.ark_list if job.state == "lost"]:
             completed = self._completed_sessions()
@@ -989,11 +1147,18 @@ class _Runner:
         if where == "completed":
             self._finish(job, found.data.get("entry") or {})
         elif where == "active":
-            return
-        elif found.code == 404 or where:
-            job.not_found += 1
-            if job.from_journal or job.not_found >= not_found_limit:
-                self._orphan(job)
+            job.uncertain_logged = False
+        elif found.code == 404 or where == "inactive":
+            entry = (found.data or {}).get("entry") or {}
+            if where == "inactive" and str(entry.get("status") or "").casefold() in {
+                    "cancelled", "canceled", "complete", "partially complete", "error", "failed", "insufficient space"}:
+                self._finish(job, entry)
+                return
+            if job.files and all(_complete(file) for file in job.files):
+                self._finish(job, {"status": "Zieldateien vollständig; Session nicht aktiv"})
+            elif not job.uncertain_logged:
+                self.log(f"Ark-Job {job.short}: Session nicht eindeutig abgeschlossen; weiter prüfen, keine Neusendung. In Ark prüfen.")
+                job.uncertain_logged = True
         else:
             self.log(f"Ark-Job {job.short}: Abfrage gescheitert ({found}); neuer Versuch bei der nächsten Abfrage.")
 
@@ -1019,16 +1184,16 @@ class _Runner:
                       for job_list, entries in (("active_jobs", list(active.values())), ("completed_jobs", completed))
                       for entry in entries
                       if str(entry.get("id", "")).startswith("restorejob_") and entry.get("id") not in known
-                      and (_session_start(entry.get("id")) or datetime.min) >= since]
+                      and since <= (_session_start(entry.get("id")) or datetime.min)
+                      <= job.created_at + timedelta(seconds=clock_tolerance_seconds)]
         matches = []
         for session_id, job_list, entry in candidates:
             spaces = _listed(self._details(session_id, job_list).get("spaces"))
             names = {str(space.get("name", "")).casefold() for space in spaces} | {str(entry.get("current_space", "")).casefold()}
             if job.mediaspace.casefold() in names and sum(_int(space.get("total_files")) for space in spaces) == len(job.files):
                 matches.append((session_id, sum(_parse_bytes(space.get("total_bytes")) for space in spaces)))
-        if len(matches) > 1:
-            size = sum(f.size for f in job.files)
-            matches = [match for match in matches if abs(match[1] - size) <= size * bytes_tolerance] or matches
+        size = sum(f.size for f in job.files)
+        matches = [match for match in matches if match[1] > 0 and abs(match[1] - size) <= size * bytes_tolerance]
         if len(matches) == 1:
             job.session_id, job.state = matches[0][0], "active"
             job.start = _session_start(job.session_id)
@@ -1036,103 +1201,79 @@ class _Runner:
             self.journal.put(job)
             self.log(f"Ark-Job {job.short} für {job.key} gefunden und zugeordnet.")
             return
-        if any(job_list == "active_jobs" for _, job_list, _ in candidates):
-            return
-        if datetime.now() < job.created_at + timedelta(minutes=lost_search_minutes):
-            return
-        missing = [f for f in job.files if f.state == "open" and not _complete(f)]
-        for f in job.files:
-            if f.state == "open" and f not in missing:
-                f.state = "restored"
-        self.log(f"Ark-Job für {job.key} nicht gefunden; {len(job.files) - len(missing)} Dateien vollständig, "
-                 f"{len(missing)} werden neu angefordert.")
-        job.state, job.decided = "done", True
-        self.ark_list.remove(job)
-        self.journal.remove([job.jid])
-        if missing and job.task:
-            self._requeue(job, missing, front=True)
+        if not job.uncertain_logged:
+            self.log(f"Ark-Job für {job.key} nicht eindeutig zugeordnet; weiter prüfen, keine automatische Neusendung. In Ark prüfen.")
+            job.uncertain_logged = True
+        if job.files and all(_complete(file) for file in job.files):
+            self._finish(job, {"status": "Zieldateien vollständig; Session nicht zugeordnet"})
 
     # --------- end of an Ark job ---------
     def _finish(self, job: _ArkJob, entry: dict) -> None:
-        data = self._details(job.session_id, "completed_jobs")
+        data = self._details(job.session_id, "completed_jobs") if job.session_id else {}
         job.ark_status = str(data.get("status") or entry.get("status") or "")
-        job.ark_text, job.end = _cut(data.get("info") or "", ark_text_chars), datetime.now()
-        open_files = [f for f in job.files if f.state == "open"]
-        missing = [f for f in open_files if not _complete(f)]
-        for f in open_files:
-            if f not in missing:
-                f.state, job.results[str(f.target)] = "restored", None
-        self.log(f"Ark-Job {job.short} ({job.key}) beendet: {job.ark_status or '?'}, {len(open_files) - len(missing)} von "
-                 f"{len(open_files)} Dateien vollständig" + (f"; Ark: {job.ark_text}" if missing and job.ark_text else ""))
+        job.ark_text = _cut(data.get("info") or "", ark_text_chars)
+        job.finish_since = job.finish_since or datetime.now()
+        job.state = "finishing"
+        self.journal.put(job)
+        self._finish_targets(job)
+
+    def _finish_targets(self, job: _ArkJob) -> None:
+        open_files = [file for file in job.files if file.state == "open"]
+        missing = [file for file in open_files if not _complete(file)]
+        elapsed = (datetime.now() - job.finish_since).total_seconds()
+        if missing and elapsed < self.finish_wait_seconds:
+            if not job.finish_logged:
+                self.log(f"Ark-Job {job.short}: Ende gemeldet, warte bis zu {self.finish_wait_seconds / 60:g} min auf vollständige Zieldateien.")
+                job.finish_logged = True
+            return
+        for file in open_files:
+            if file not in missing:
+                file.state, job.results[str(file.target)] = "restored", None
+        job.end = datetime.now()
+        self.log(f"Ark-Job {job.short} beendet: {job.ark_status}, {len(open_files) - len(missing)} von {len(open_files)} Dateien vollständig.")
         if job.task:
             self._decide(job, missing)
+        elif missing:
+            self._fail(job, missing, _reason("INCOMPLETE", "Zieldatei fehlt nach Nachlaufzeit", job))
+            job.decided = True
         self._close(job)
 
     def _decide(self, job: _ArkJob, missing: list[_File]) -> None:
         job.decided = True
         if not missing:
             return
-        code, status = job.stop_code, job.ark_status.casefold()
-        ark_text = _cut(f"Ark-Status {job.ark_status}" + (f", {job.ark_text}" if job.ark_text else ""), ark_text_chars)
+        status = job.ark_status.casefold()
+        code = job.stop_code
         if code in ("TAPES_OFFLINE", "TAPE_DEFECT"):
             self._fail(job, missing, job.stop_reason)
-        elif code == "DRIVE_ERROR" or (not code and status.startswith("unknown")):
-            marker = code or "UNKNOWN"
-            if marker in job.resent and code:
-                self._fail(job, missing, f"{job.stop_reason} (auch nach Wiederholung)")
-            elif marker in job.resent:
-                self._halve(job, missing, _reason("ARK_ERROR", ark_text, job))
-            else:
-                self.log(f"Ark-Job {job.short} ({job.key}) wird einmal unverändert neu gesendet ({marker}).")
-                self._requeue(job, missing, resent={marker})
-        elif code:
-            self._halve(job, missing, job.stop_reason)
-        elif "cancel" in status:
-            self._fail(job, missing, _reason("CANCELLED", job=job))
-        elif "insufficient space" in status and "NO_SPACE" not in job.resent:
-            self.log(f"Ark-Job {job.short} ({job.key}): Ark meldet {job.ark_status}; neuer Ark-Job wartet auf Speicherplatz.")
-            self._requeue(job, missing, resent={"NO_SPACE"})
-        elif "insufficient space" in status:
-            self._fail(job, missing, _reason("NO_SPACE", f"Ark meldet {job.ark_status} (auch nach Warten auf Speicherplatz)", job))
-        elif status == "complete":
-            self._halve(job, missing, _reason("INCOMPLETE", "Ark meldet Complete, Datei fehlt oder Größe falsch", job))
-        else:
-            self._halve(job, missing, _reason("ARK_ERROR", ark_text, job))
-
-    def _halve(self, job: _ArkJob, missing: list[_File], reason: str) -> None:
-        if len(job.files) == 1:
-            self._fail(job, missing, reason)
             return
-        half = (len(missing) + 1) // 2
-        parts = [part for part in (missing[:half], missing[half:]) if part]
-        for part in parts:
-            self._requeue(job, part)
-        self.log(f"Ark-Job {job.short} ({job.key}): {len(missing)} offene Dateien in {len(parts)} neue Ark-Jobs aufgeteilt.")
+        if not code and "cancel" in status:
+            self._fail(job, missing, _reason("CANCELLED", job=job))
+            return
+        code = code or ("NO_SPACE" if "insufficient space" in status else "INCOMPLETE" if status == "complete" else "ARK_ERROR")
+        reason = job.stop_reason or _reason(code, f"Ark-Status {job.ark_status}; Zieldatei fehlt nach Nachlaufzeit", job)
+        if job.attempt >= 2:
+            self._fail(job, missing, f"{reason} (auch nach Wiederholung)")
+            return
+        self.log(f"Ark-Job {job.short}: einmalige Wiederholung der offenen Dateien ({code}), keine Halbierung.")
+        self._requeue(job, missing)
+
 
     def _requeue(self, job: _ArkJob, files: list[_File], *, resent: set[str] = frozenset(), attempt: int | None = None,
                  front: bool = False) -> None:
-        new = _ArkJob(job.key, files, job.mediaspace, job.share_root, attempt=attempt or job.attempt + 1, task=job.task,
-                      resent=job.resent | set(resent))
-        job.task.ark_jobs.append(new)
-        self.ark_list.append(new)
-        self.retry_queue.appendleft(new) if front else self.retry_queue.append(new)
+        plans = _plan_ark_files(files, self.max_files_per_ark_job)
+        for part in reversed(plans) if front else plans:
+            new = _ArkJob(job.key, part, job.mediaspace, job.share_root, attempt=attempt or job.attempt + 1, task=job.task,
+                          resent=job.resent | set(resent))
+            job.task.ark_jobs.append(new)
+            self.ark_list.append(new)
+            self.retry_queue.appendleft(new) if front else self.retry_queue.append(new)
 
     def _fail(self, job: _ArkJob, files: list[_File], reason: str) -> None:
         for f in files:
             f.state, f.reason = "failed", reason
             job.results[str(f.target)] = reason
 
-    def _orphan(self, job: _ArkJob) -> None:
-        open_files = [f for f in job.files if f.state == "open"]
-        missing = [f for f in open_files if not _complete(f)]
-        for f in open_files:
-            if f not in missing:
-                f.state, job.results[str(f.target)] = "restored", None
-        self._fail(job, missing, _reason("ORPHANED", f"{job.short} in Ark nicht bekannt, Datei fehlt oder unvollständig"))
-        job.decided, job.end = True, datetime.now()
-        self.log(f"Ark-Job {job.short} ({job.key}) in Ark nicht bekannt (verwaist): {len(open_files) - len(missing)} Dateien "
-                 f"vollständig, {len(missing)} gescheitert.")
-        self._close(job)
 
     def _close(self, job: _ArkJob) -> None:
         self._acknowledge(job)
@@ -1183,17 +1324,23 @@ class _Runner:
         jobs = [job for job in self.ark_list if job.state == "active" and job.session_id]
         if number:
             for job in jobs:
-                if any(pid.endswith(number) for pid in job.process_ids) and (not volume or volume in job.copy_tapes()):
+                date = _parse_date(alert.get("AlertDate"))
+                if date and job.start and date.timestamp() < job.start.timestamp():
+                    continue
+                if any(pid == number or re.search(r"(?:^|[_:-])" + re.escape(number) + r"$", pid) for pid in job.process_ids) and (not volume or volume in job.copy_tapes()):
                     return job, True
         date = _parse_date(alert.get("AlertDate"))
         for job in jobs:
-            if job.status.startswith("Running") and volume in job.copy_tapes() and date and job.start and date >= job.start:
+            if job.status.startswith("Running") and volume in job.copy_tapes() and date and job.start and date.timestamp() >= job.start.timestamp():
                 return job, False
         return None, False
 
     def _handle_alerts(self, fresh: list[tuple[str, dict]]) -> None:
         actions: dict[_ArkJob, dict] = {}
         for server_id, alert in fresh:
+            date = _parse_date(alert.get("AlertDate"))
+            if date and not self.started_at.timestamp() <= date.timestamp() <= datetime.now().timestamp() + clock_tolerance_seconds:
+                continue
             job, by_number = self._alert_job(alert)
             if job is None:
                 continue
@@ -1208,6 +1355,11 @@ class _Runner:
         for job, alert in actions.items():
             number, volume, drive = _int(alert.get("Number")), alert.get("VolumeName"), alert.get("Drive")
             if number == alert_media:
+                date = _parse_date(alert.get("AlertDate"))
+                _, by_number = self._alert_job(alert)
+                if by_number and date and job.start:
+                    if date.timestamp() >= job.start.timestamp() and volume:
+                        self._learn_tape(job, str(volume), "Medienfehler (Tape-Alarm 4)")
                 if job.task:
                     job.task.defect_tapes.add(str(volume))
                 self._stop(job, "TAPE_DEFECT", f"Media-Alarm auf {volume}, Laufwerk {drive}", "Tape-Alarm")
@@ -1256,6 +1408,9 @@ class _Runner:
         barcodes = [str(code) for code in (re.split(r"[,;\s]+", barcodes) if isinstance(barcodes, str) else barcodes) if code]
         for job in own or jobs:
             if hits := [code for code in barcodes if code.casefold() in job.copy_tapes()]:
+                if job in own:
+                    for tape in hits:
+                        self._learn_tape(job, tape, "Benötigtes Band von Ark als fehlend gemeldet")
                 self._stop(job, "TAPES_OFFLINE", f"Band {', '.join(hits)} fehlt in der Library ({_cut(entry.get('msg'), 100)})", "Benachrichtigung")
 
     # --------- results and status ---------
@@ -1264,7 +1419,7 @@ class _Runner:
         if self.on_clip is None:
             return
         for task in self.tasks.values():
-            if task.problem:
+            if task.problem or task.precheck_waiting or not task.prepared:
                 continue  # The whole order is reported at once.
             clips: dict[str, list[dict]] = {}
             for entry in task.entries:
@@ -1272,6 +1427,8 @@ class _Runner:
                     clips.setdefault(clip_id, []).append(entry)
             ready = {clip_id: [_file_result(entry) for entry in entries] for clip_id, entries in clips.items()
                      if clip_id not in task.reported
+                     and not any(job.state != "done" and any(entry["file"] in job.files for entry in entries)
+                                 for job in task.ark_jobs)
                      and all(entry["reason"] or (entry["file"] and entry["file"].state != "open") for entry in entries)}
             if not ready:
                 continue
@@ -1285,7 +1442,7 @@ class _Runner:
 
     def _finish_tasks(self) -> None:
         for key, task in list(self.tasks.items()):
-            if any(job.state != "done" for job in task.ark_jobs):
+            if not task.prepared or task.precheck_waiting or any(job.state != "done" for job in task.ark_jobs):
                 continue
             if stray := [f for f in task.files if f.state == "open"]:
                 for f in stray:
@@ -1317,8 +1474,10 @@ class _Runner:
     def _status_lines(self) -> list[str]:
         lines, busy = [], self._busy_tapes()
         for job in self.ark_list:
-            status = pending_states.get(job.state) or job.status or "?"
+            status = "wartet auf Zieldateien" if job.state == "finishing" else pending_states.get(job.state) or job.status or "?"
             blocked = [tape for tape in job.tape_list() if tape.casefold() in busy] if job.state == "pending" else []
+            if job.uncertain_logged and job.state in ("active", "lost"):
+                status = "Session unklar; in Ark prüfen"
             if job.state == "pending" and job.space_wait:
                 status = f"wartet auf Speicherplatz ({job.space_wait})"
             elif blocked:
@@ -1326,6 +1485,9 @@ class _Runner:
             status += f" (Stopp {job.stop_code})" if job.stop_code else ""
             lines.append(f"{job.short:<18} {job.tapes:<10} {job.key}  {status}  {job.progress or '–'}  "
                          f"{job.remaining or '–'}  Versuch {job.attempt}")
+        lines.extend(f"{task.job.key}  wartet auf Vorprüfung" for task in self.tasks.values() if task.precheck_waiting)
+        if self.preflight_issue:
+            lines.append(f"Vorprüfung wartet: {self.preflight_issue}")
         return lines or ["Keine Ark-Jobs"]
 
 
@@ -1334,7 +1496,7 @@ def _file_result(entry: dict) -> dict:
     if entry.get("result"):
         return entry["result"]
     f = entry["file"]
-    restored = f is not None and f.state == "restored"
+    restored = f is not None and f.state == "restored" and not entry["reason"]
     reason = None if restored else entry["reason"] or (f.reason if f else None) or _reason("INVALID_INPUT")
     return {**{name: entry["item"].get(name) for name in item_fields}, "state": "restored" if restored else "failed",
             "reason": reason, "path": str(f.target) if restored else None}
@@ -1361,7 +1523,8 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
         on_clip: Callable[[RestorerJob, list[dict]], object] | None = None,
         cred_path: str | Path | None = None, journal_path: str | Path | None = None, log_path: str | Path | None = None,
         poll_seconds: float = 10, max_ark_queue: int = 0, stall_minutes: float = 60, reserve_gb: float = 50,
-        max_files_per_ark_job: int | None = None) -> None:
+        max_files_per_ark_job: int | None = None, blocked_tapes_path: str | Path | None = None,
+        finish_wait_minutes: float = 5) -> None:
     """Restore the files of all jobs from LTO tape via Ark; returns when jobs is exhausted and all Ark jobs ended.
 
     jobs: list or generator of RestorerJob; a generator yields None while no order is available.
@@ -1370,7 +1533,10 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
     on_clip(job, files) is called once per clip as soon as all its entries are finished (files as in RestorerResult);
     the restorer does not change that clip folder afterwards, also not after a restart (the journal keeps such clips).
     max_ark_queue: 0 sends new Ark jobs at once, n >= 1 sends while fewer than n Ark jobs wait in Ark.
-    max_files_per_ark_job: optional file cap for each planned Ark job; None preserves the existing grouping.
+    max_files_per_ark_job: optional file cap; None means unlimited, not a different tape selection.
+    blocked_tapes_path: editable UTF-8 file of barcodes; None keeps automatic blocks in memory only.
+    finish_wait_minutes: time allowed for Ark to publish target files after a confirmed job end.
+    Uncertain sessions are monitored, never automatically sent again. Failed finished jobs are retried at most once.
     Ctrl+C stops the restorer, not the Ark jobs; the next start resumes them from the journal.
     Raises ValueError for invalid parameters, FileNotFoundError/RuntimeError if Ark or the journal are not usable.
     """
@@ -1378,12 +1544,12 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
         raise ValueError("on_result ist Pflicht und muss aufrufbar sein.")
     if on_clip is not None and not callable(on_clip):
         raise ValueError("on_clip muss aufrufbar sein.")
-    numbers = {"poll_seconds": poll_seconds, "stall_minutes": stall_minutes}
-    if bad := [name for name, value in numbers.items() if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0]:
+    numbers = {"poll_seconds": poll_seconds, "stall_minutes": stall_minutes, "finish_wait_minutes": finish_wait_minutes}
+    if bad := [name for name, value in numbers.items() if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0]:
         raise ValueError(f"{', '.join(bad)} muss eine Zahl > 0 sein.")
     if isinstance(max_ark_queue, bool) or not isinstance(max_ark_queue, int) or max_ark_queue < 0:
         raise ValueError("max_ark_queue muss eine ganze Zahl >= 0 sein.")
-    if isinstance(reserve_gb, bool) or not isinstance(reserve_gb, (int, float)) or reserve_gb < 0:
+    if isinstance(reserve_gb, bool) or not isinstance(reserve_gb, (int, float)) or not math.isfinite(reserve_gb) or reserve_gb < 0:
         raise ValueError("reserve_gb muss eine Zahl >= 0 sein.")
     if max_files_per_ark_job is not None and (isinstance(max_files_per_ark_job, bool)
                                                or not isinstance(max_files_per_ark_job, int)
@@ -1393,7 +1559,8 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
     on_log, on_status = on_log or console.log, on_status or console.status
     runner = _Runner(jobs, on_result, on_log, on_status, Path(cred_path or default_cred_path),
                      Path(journal_path or default_journal_path), poll_seconds, max_ark_queue, stall_minutes, reserve_gb,
-                     on_clip, max_files_per_ark_job)
+                     on_clip, max_files_per_ark_job, Path(blocked_tapes_path) if blocked_tapes_path is not None else None,
+                     finish_wait_minutes)
     try:
         runner.loop()
     except KeyboardInterrupt:

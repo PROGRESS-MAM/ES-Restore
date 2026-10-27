@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+import unittest
 
 
 ark_api = ModuleType("ArkAPI")
@@ -50,7 +51,12 @@ def _file(flow_hash, tape, group=()):
 
 def _resolve_files(files, copies, in_changer=None, max_files_per_ark_job=50):
     ark = MockArk(copies, in_changer)
-    runner = SimpleNamespace(ark=ark, max_files_per_ark_job=max_files_per_ark_job)
+    runner = _Runner.__new__(_Runner)
+    runner.ark = ark
+    runner.max_files_per_ark_job = max_files_per_ark_job
+    runner.safety = SimpleNamespace(read=lambda: set())
+    runner.log = lambda text: None
+    runner.preflight_issue = None
     unresolved = _Runner._check_ark(runner, files)
     return ark, unresolved
 
@@ -113,16 +119,16 @@ def test_planning_uses_ark_first_copy_not_naive_tape():
     assert file.group == ("ARK_PRIMARY",)
     plans = _plan_ark_files(unresolved, 50)
     assert plans == [[file]]
-    assert ark.location_requests == [["ARK_PRIMARY"]]
+    assert ark.location_requests == [["ARK_PRIMARY", "NAIVE"]]
 
 
-def test_unconfigured_restorer_keeps_naive_tape_selection():
+def test_unconfigured_restorer_uses_same_copy_selection():
     file = _file("hash", "NAIVE")
 
     _, unresolved = _resolve_with_ark(file, [["ARK_PRIMARY"], ["NAIVE"]], max_files_per_ark_job=None)
 
     assert unresolved == [file]
-    assert file.group == ("NAIVE",)
+    assert file.group == ("ARK_PRIMARY",)
 
 
 def test_tape_only_request_skips_disk_copy():
@@ -132,7 +138,7 @@ def test_tape_only_request_skips_disk_copy():
 
     assert unresolved == [file]
     assert file.group == ("ARK_PRIMARY",)
-    assert ark.location_requests == [["ARK_PRIMARY"]]
+    assert ark.location_requests == [["ARK_PRIMARY", "NAIVE"]]
 
 
 def test_offline_ark_selected_copy_is_rejected_before_restore():
@@ -142,9 +148,9 @@ def test_offline_ark_selected_copy_is_rejected_before_restore():
 
     assert unresolved == []
     assert file.state == "failed"
-    assert file.reason.startswith("TAPES_OFFLINE:")
+    assert file.reason.startswith("PREFLIGHT_OFFLINE:")
     assert "ARK_PRIMARY" in file.reason
-    assert ark.location_requests == [["ARK_PRIMARY"]]
+    assert ark.location_requests == [["ARK_PRIMARY", "NAIVE"]]
 
 
 def test_unlimited_mode_preserves_existing_copy_grouping():
@@ -153,8 +159,17 @@ def test_unlimited_mode_preserves_existing_copy_grouping():
 
     plans = _plan_ark_files([first, second], None)
 
-    assert plans == [[first, second]]
+    assert plans == [[first], [second]]
 
 
 def test_marathon_default_file_limit_is_50():
     assert restore_marathon.max_files_per_ark_job == 50
+
+
+class PlanningTests(unittest.TestCase):
+    pass
+
+
+for test_name, test_function in list(globals().items()):
+    if test_name.startswith("test_") and callable(test_function):
+        setattr(PlanningTests, test_name, lambda self, function=test_function: function())

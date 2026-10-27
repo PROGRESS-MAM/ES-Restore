@@ -1,0 +1,16 @@
+# Eine Bandkennung je Zeile. Kommentare beginnen mit #.
+# Diese Startliste enthält historische Befunde aus den bereitgestellten Protokollen.
+# Kein Nachweis des heutigen Zustands; nach Prüfung Einträge manuell entfernen.
+# Neue eindeutige Ark-Meldungen ergänzt der Restorer automatisch.
+E80028L8 # Fehlend gemeldet am 2026-10-23
+LS2044L8 # Fehlend gemeldet am 2026-10-23
+LS2121L8 # Fehlend gemeldet am 2026-10-24
+LS2201L8 # Nicht in der Library gemeldet am 2026-10-24
+LS2221L8 # Nicht in der Library gemeldet am 2026-10-24
+LS2222L8 # Fehlend gemeldet am 2026-10-24
+LS2226L8 # Nicht in der Library gemeldet am 2026-10-24
+LS2231L8 # Fehlend gemeldet am 2026-10-24
+LS2248L8 # Fehlend gemeldet am 2026-10-23
+LS2259L8 # Fehlend gemeldet am 2026-10-23
+LS2048L8 # Media-Alarm am 2026-10-24
+LS2037L8 # Media-Alarm am 2026-10-25

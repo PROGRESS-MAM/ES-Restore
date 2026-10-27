@@ -1,246 +1,180 @@
 # ES-Restore
 
-Holt Dateien per FLOW-Hash über die ARK-API vom LTO-Band in einen Zielordner. Das Paket `restorer` ist universell einsetzbar. Der Marathon-Adapter macht daraus einen Restore-Worker für Marathon: Er übernimmt Restore-Jobs aus dem Pool, lässt die Dateien von Ark zurückholen, meldet jeden fertigen Clip sofort mit einem Teilbericht und am Ende je Datei das Ergebnis an Marathon.
+Restore-Worker für Marathon und Python-Modul zum Zurückholen von Dateien per FLOW-Hash über Ark. Der Restorer prüft Clips vor dem Senden, erstellt kleine Ark-Jobs und meldet die Ergebnisse über die bestehenden Marathon-Reports und Teilberichte.
 
-## Aufbau
+## Installation und EXE-Bau
 
-| Pfad | Aufgabe |
-|---|---|
-| `restorer/` | Paket: `run()`, `versions()`, `RestorerJob`, `RestorerResult`; Code in `restorer/restorer.py` |
-| `cred.env` | Ark-Zugangsdaten für das Modul, nur lokal |
-| `marathon/marathon_adapter.py` | allgemeiner Teil aller Marathon-Adapter, Kopie der Referenz 1.3.0, **nicht verändern** |
-| `marathon/restore_marathon.py` | Restore-Adapter: Einstellungen, Einstieg der EXE |
-| `marathon/cred.env` | Ark-Zugangsdaten für die EXE, nur lokal; wird beim Build in die EXE gelegt |
-| `marathon/build_restore.py` | baut die EXE |
+Python 3.11 oder neuer. Im Repo:
 
-## Installation
-
-Python 3.11+. Einmal je Rechner die Paketquelle der Flow-API eintragen:
-
-```
+```console
 pip config set global.extra-index-url https://artifacts.editshare.com/artifactory/api/pypi/editshare-pypi-public/simple
-```
-
-Dann im Projektordner:
-
-```
-pip install -e .            # toolbox mit ArkAPI und FlowAPI
-pip install -e ".[build]"   # zusätzlich pyinstaller für den Build
-```
-
-In ein anderes Projekt installieren:
-
-```
-pip install "es-restore @ git+https://github.com/PROGRESS-MAM/ES-Restore.git@main"
-```
-
-Aktualisieren mit `pip install --force-reinstall --no-deps "es-restore @ git+https://github.com/PROGRESS-MAM/ES-Restore.git@main"`. Die Paketquelle der Flow-API muss eingetragen sein (siehe Installation).
-
-
-Zugangsdaten `cred.env`
-
-```
-ARK_HOST=<host>
-ARK_USER=<user>
-ARK_PASSWORD=<passwort>
-```
-
-Je Programm genau eine Datei: `cred.env` im Projektordner für das Modul, `marathon/cred.env` für die EXE. Beide stehen in `.gitignore` und werden nie eingecheckt. Die EXE enthält ihre Zugangsdaten und darf nur auf berechtigte Rechner.
-
-## Marathon-Worker starten
-
-Voraussetzung: Marathon 1.17.0 (`schema_version` 6, Restore-Sammeljobs, Teilberichte) und Marathon-Adapter 1.3.0 (CR-006 bis CR-014 in `INTERFACES.md`). `marathon/marathon_adapter.py` ist eine unveränderte Kopie dieser Referenz.
-
-Als Skript aus dem Projektordner:
-
-```
-python -m marathon.restore_marathon
-```
-
-Als EXE: `restore_marathon_<version>.exe` auf den Rechner kopieren und starten. Der Rechner braucht Lese- und Schreibzugriff auf die Marathon-Freigabe und Zugriff auf Ark.
-
-- Der Worker heißt `<Rechnername>-Restore`. Je Rechner läuft ein Restore-Worker, daneben QC- und Transcode-Worker; ein zweiter Restore-Worker auf demselben Rechner bricht ab.
-- Er übernimmt mehrere Restore-Jobs gleichzeitig. Einen neuen Job holt er nur, wenn die Steuerung einen neuen Ark-Job erlaubt (`max_ark_queue`) und kein wartender Ark-Job gesendet werden kann. Solange ein Ark-Job auf Speicherplatz wartet, holt er keinen neuen Job.
-- Beenden mit `Strg+C`. Laufende Ark-Jobs werden nicht gestoppt; beim nächsten Start werden die übernommenen Jobs und ihre Ark-Jobs aus dem Journal wieder aufgenommen. Schon gemeldete Clips werden nicht erneut angefordert oder gemeldet.
-- Log `restore_marathon.log` und Journal `restore_marathon.journal.json` neben der EXE bzw. in `marathon/`.
-
-### Konsolenausgabe
-
-Ereigniszeilen mit Uhrzeit (Übernahme, Ark-Job angelegt, Warten auf Band oder Speicherplatz, Statuswechsel, Stopp, Ende, Teilbericht, Fehler, Ergebnis) stehen in Konsole und Log. Darunter steht ein Statusblock mit einer Zeile je verwaltetem Ark-Job: Session, Band, `key`, Status, Fortschritt, Restzeit, Versuch. Er wird bei jeder Abfrage an Ort und Stelle erneuert und nie ins Log geschrieben.
-
-Beispiel:
-
-```text
-restorejob_N9SMTL  LS2048L8  20261016T…__1_restore  Running   981 MiB / 14.1 GiB  6h:52m:22s  Versuch 1
-restorejob_K2PQRA  LS2051L8  20261016T…__1_restore  Enqueued  –                   –           Versuch 1
-–                  LS2048L8  20261016T…__2_restore  wartet auf Band LS2048L8  –  –  Versuch 1
-–                  LS2060L8  20261016T…__2_restore  wartet auf Speicherplatz (es fehlen 120.0 GB)  –  –  Versuch 1
-```
-
-Status ohne Session: `wartet auf Steuerung`, `wartet auf Band …` (Bandsperre), `wartet auf Speicherplatz (es fehlen … GB)`, `wird angelegt`, `Session-ID wird gesucht`.
-
-Pfade werden in Konsole und Log ab einschließlich `.marathon` gekürzt (`.marathon\restore\…`). Report und Journal enthalten vollständige Pfade.
-
-## EXE bauen
-
-```
+pip install -e ".[build]"
 python marathon/build_restore.py
 ```
 
-Ergebnis: `dist/restore_marathon_<app_version>.exe` mit Adapter, Paket `restorer`, toolbox und `marathon/cred.env`. Änderungen an Einstellungen oder Zugangsdaten gelten erst mit einem neuen Build.
+Für den Build `marathon/cred.env` lokal anlegen:
 
-## Einstellungen in `restore_marathon.py`
+```dotenv
+ARK_HOST=<host>
+ARK_USER=<user>
+ARK_PASSWORD=<password>
+```
 
-| Eintrag | Wert | Bedeutung |
+Die Zugangsdaten bleiben außerhalb von Git, werden aber wie bisher in die EXE eingebaut. Die EXE nur an berechtigte Rechner weitergeben.
+
+Ergebnis: `dist/restore_marathon_0.3.0.exe` und daneben `blocked_tapes.txt`. Die Sperrdatei wird **nicht in die EXE eingebaut**. Beim erneuten Build bleibt eine bereits vorhandene Sperrdatei in `dist/` unverändert. Code, Launcher-Einstellungen oder Zugangsdaten ändern: neu bauen. Sperrliste ändern: **kein Neubau und kein Neustart nötig**.
+
+## Start und Update
+
+EXE und Sperrdatei gemeinsam in den Betriebsordner kopieren. Bei einem Update die dort bereits gepflegte `blocked_tapes.txt` behalten. Bestehendes `restore_marathon.journal.json` ebenfalls behalten; nicht löschen oder manuell bearbeiten.
+
+Als Skript im Repo:
+
+```console
+python -m marathon.restore_marathon
+```
+
+Der Rechner benötigt Zugriff auf Ark und Lese-/Schreibzugriff auf die Marathon-Freigabe sowie auf Sperrdatei und Journal. Je Rechner darf genau ein Restore-Worker laufen. Beenden mit `Strg+C`: Bereits angelegte Ark-Jobs laufen weiter und werden beim nächsten Start aus dem Journal übernommen.
+
+Neben der EXE, beim Skriptstart in `marathon/`:
+
+| Datei | Bedeutung |
+|---|---|
+| `blocked_tapes.txt` | Manuelle und automatisch ergänzte Bandsperren |
+| `restore_marathon.log` | Ereignisse, Vorprüfungsgründe, automatische Sperren, Fehler |
+| `restore_marathon.journal.json` | Wiederaufnahme und bereits gemeldete Clips |
+
+Voraussetzung bleibt Marathon mit Zustandsschema 8 und Jobschema 6 sowie Marathon-Adapter 1.3.0. Es ist **keine Anpassung oder Migration von `marathon.json` nötig**. Der gemeinsame `marathon/marathon_adapter.py` bleibt unverändert.
+
+## Marathon konfigurieren
+
+Marathon bleibt unverändert. In seiner vorhandenen Config:
+
+```ini
+[limits]
+restore_big_job = 0
+restore_small_job = 2
+```
+
+`[restore] small_job_clips` begrenzt die Clips je kleinem Marathon-Job. Die vorhandene Marathon-Auswahlregel und Fehlerzählung bleiben bestehen. Zwei kleine Marathon-Jobs sind nicht dasselbe wie zwei gleichzeitig laufende Ark-Jobs; Ark-Jobs unterliegen zusätzlich Queue-, Band- und Speicherplatzsteuerung.
+
+## Sperrliste pflegen
+
+`blocked_tapes.txt` ist eine UTF-8-Datei. Eine Bandkennung je Zeile; leere Zeilen und Kommentare mit `#` sind erlaubt. Groß-/Kleinschreibung wird ignoriert.
+
+```text
+# Manuelle Sperren
+LS2044L8 # Band fehlt
+LS2048L8 # Auffälliges Medium, vorerst nicht verwenden
+```
+
+Die mitgelieferte Startliste enthält zehn als fehlend bzw. außerhalb der Library gemeldete Bänder und zwei Bänder mit Media-Alarm aus den bereitgestellten Protokollen vom 23.–25. Oktober 2026. Das sind **historische Befunde**, kein Nachweis des heutigen Zustands. Nach Prüfung betreffende Einträge manuell entfernen. Laufwerksfehler wurden nicht als Bandsperren übernommen.
+
+- Vor neuen Ark-Jobs, auch vor Wiederholungen, wird die Datei erneut gelesen.
+- Eine gesperrte Kennung in **irgendeiner gemeldeten Bandkopie** einer noch zu restaurierenden Datei stellt den gesamten Clip zurück. Eine andere verfügbare Kopie hebt die Sperre nicht auf.
+- Eine nicht vollständig in der Library liegende Bandkopie stellt den Clip ebenfalls zurück, auch wenn eine andere Kopie verfügbar wäre.
+- Die Datei muss vorhanden, lesbar und gültig sein. Fehler oder noch nicht speicherbare automatische Einträge pausieren neue Ark-Jobs; bereits angelegte Jobs werden weiter überwacht. Datei reparieren bzw. Schreibrechte herstellen: Die Prüfung wird automatisch erneut versucht.
+- Doppelte Kennungen sind zulässig und wirken wie eine Sperre. Automatische Ergänzungen erzeugen keine neuen Duplikate und überschreiben keine manuellen Zeilen oder Kommentare.
+
+### Automatische Ergänzungen
+
+Der Restorer nutzt strukturierte Ark-Benachrichtigungen und Tape-Alarme:
+
+| Befund | Automatische Sperre |
+|---|---|
+| Neues Ereignis „benötigtes Band fehlt“, mit Kennung und Zuordnung zu einem eigenen Restore | Ja, Grund „fehlend“ |
+| Neuer Media-Alarm 4, mit Kennung, Tape-Job-Nummer und passendem Ereigniszeitpunkt seit dem aktuellen Programmstart für einen eigenen Restore | Ja, Grund „Medienfehler“ |
+| Nur Zuordnung über vermutetes Band, alte/fremde Meldung oder fehlende eindeutige Kennung | Nein |
+| Laufwerksdiagnose, allgemeiner Hard-Error, Stillstand oder unklare Session | Nein |
+
+Neue Einträge erhalten Zeitpunkt und Grund, etwa `LS2048L8 # auto ...: Medienfehler (Tape-Alarm 4)`. Eine Sperre wird **nie automatisch entfernt**. Nach manueller Entfernung kann ein neuer eindeutiger Fehler dasselbe Band erneut sperren. Bereits im eigenen Journal gespeicherte, noch nicht dauerhaft eingetragene Bandbefunde werden bei der Wiederaufnahme nachgetragen.
+
+## Restore-Ablauf
+
+1. Eingaben, Zielpfad und Media Space prüfen. Bereits vollständig vorhandene Zieldateien werden nicht erneut angefordert.
+2. Für die übrigen Dateien alle von Ark gemeldeten Bandkopien auf Sperren und Library-Anwesenheit prüfen. Nicht erreichbare oder unvollständige Ark-Auskunft: warten statt Clips endgültig scheitern lassen.
+3. **Unsichere Clips vollständig zurückstellen, sichere Clips desselben Marathon-Jobs ausführen.** Eine fehlende/ungültige Datei verhindert auch das Anfordern der übrigen Dateien dieses Clips.
+4. Normale Ark-Jobs nach dem vermuteten Band gruppieren und durch `max_files_per_ark_job` begrenzen. Die erste nichtleere Bandkopie aus Arks Auskunft ist die Planungsannahme – keine Garantie für Arks tatsächliche Auswahl. Eine über mehrere Bänder verteilte Datei erhält einen eigenen Mehrband-Job mit genau einer Datei.
+5. Vor dem Senden erneut prüfen. Kopienwechsel können eine neue Aufteilung erforderlich machen. Queue-, Band- und Speicherplatzgrenzen gelten weiterhin.
+6. Nach erkanntem Ark-Ende bis zu `finish_wait_minutes` auf vollständige Zieldateien warten. Erst danach Erfolg bzw. Fehler melden. Jeder Clip wird erst freigegeben, wenn alle seine Ark-Jobs beendet sind; danach fasst der Restorer seinen Ordner nicht mehr an.
+7. Eindeutig beendete Jobs mit vorübergehenden Fehlern höchstens **einmal** wiederholen, weiterhin in kleinen Jobs. Keine rekursive Halbierung. Keine Wiederholung bei bekannten Bandproblemen oder manuellem Abbruch.
+
+Eine nicht auffindbare oder nicht eindeutig zugeordnete Session wird **nicht automatisch neu gesendet oder allein deswegen als beendet gewertet**. Der Restorer sucht weiter. Sind alle erwarteten Zieldateien vollständig vorhanden, kann er deren Ergebnis übernehmen. Andernfalls erscheint „Session unklar; in Ark prüfen“. Das kann neue Jobs blockieren: In Ark den wirklichen Zustand prüfen; das Journal nicht zur Umgehung löschen.
+
+„Sicher“ heißt nur „kein bekanntes Risiko festgestellt“. Unbekannte Medienfehler, unvollständige Ark-Metadaten und eine abweichende Kopienwahl bleiben möglich.
+
+## Einstellungen im Launcher
+
+`marathon/restore_marathon.py`:
+
+| Eintrag | Standard | Bedeutung |
 |---|---|---|
-| `app_version` | | Version der EXE |
-| `root_path` | `\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit` | Wurzel der Marathon-Freigabe, wie `root_path` in Marathons `res/config.ini` |
-| `work_dir` | `.marathon` | Arbeitsordner von Marathon, wie `work_dir` in Marathons `res/config.ini` |
-| `stage` | `Restore` | Stufe |
-| `resume` | `True` | übernommene Jobs nach einem Neustart wieder aufnehmen statt als `failed` zu melden |
-| `poll_seconds` | `10` | Abfrageintervall für Pool und Ark |
-| `heartbeat_seconds` | `30` | Abstand der Lebenszeichen an Marathon, 1 bis 60 |
-| `max_ark_queue` | `1` | Steuerung, siehe „Steuerung“ |
-| `max_files_per_ark_job` | `50` | Höchstzahl Dateien je Ark-Job auf einem Band; Dateien mit mehrteiliger Bandkopie erhalten einen eigenen Ark-Job |
-| `stall_minutes` | `60` | Minuten ohne Fortschritt im Status `Running` bis zum Stopp |
-| `reserve_gb` | `500` | Platzreserve im Ziel in GB (10^9 Byte); deckt auch wartende Ark-Jobs ab, für die Ark noch keine Datenmenge meldet |
+| `root_path` | vorhandene Marathon-Freigabe | Muss mit Marathons `root_path` übereinstimmen |
+| `work_dir` | `.marathon` | Muss mit Marathons `work_dir` übereinstimmen |
+| `stage` | `Restore` | Worker-Stufe |
+| `resume` | `True` | Jobs nach Neustart wieder aufnehmen |
+| `poll_seconds` | `10` | Sekunden zwischen Abfragen |
+| `heartbeat_seconds` | `30` | Abstand der Lebenszeichen; 1–60 Sekunden |
+| `max_ark_queue` | `1` | Nur senden, wenn kein Ark-Job wartet, auch kein fremder; `0` hebt diese Queue-Grenze auf |
+| `max_files_per_ark_job` | `50` | Dateigrenze für normale Ark-Jobs; `None` bedeutet unbegrenzt, ohne Änderung der Kopienwahl |
+| `stall_minutes` | `60` | Running ohne Fortschritt: Stopp |
+| `reserve_gb` | `2000` | Platzreserve im Ziel in GB (10^9 Byte) |
+| `finish_wait_minutes` | `5` | Nachlaufzeit für die Zielübergabe nach erkanntem Ark-Ende |
+| `blocked_tapes_path` | `blocked_tapes.txt` neben EXE/Skript | Externe, laufend neu gelesene Sperrdatei |
+| `app_version` | `0.3.0` | Version der EXE; Restorer-Paketversion ist `0.4.0` |
 
-## Ergebnis eines Marathon-Jobs
+Die Bandbelegung basiert auf der Planungsannahme; normale eigene Ark-Jobs auf demselben vermuteten Band werden nicht parallel gesendet. Mehrband-Jobs sperren ihre gesamte vermutete Bandkombination. Neue Jobs warten bei zu wenig Speicherplatz; die Prüfung berücksichtigt ausstehende Restores zum selben Media Space und die Reserve.
 
-- Dateien: `<output_folder>/<Clip-Ordner>/<file>`.
-- Report in `report_folder`: `<job_id>.json` mit `status`, `result` (Kurztext), `items`, `worker` und `versions`.
-- `status`: `ok`, wenn alle Einträge `restored` sind, sonst `failed`.
-- `items`: je Job-Eintrag genau einmal `clip_id`, `flow_hash`, `status` (`restored`/`failed`), `path` (relativ zu `root_path`, `/` als Trenner) und `reason`.
-- `reason` einer gescheiterten Datei, höchstens 300 Zeichen: Grund, Band, wenn bekannt Laufwerk, kurze Session-ID und gekürzter Ark-Text, z. B. `TAPE_DEFECT: Media-Alarm auf LS2048L8, Laufwerk 1 (restorejob_N9SMTL)`.
-- Teilbericht je Clip in `report_folder`: `<job_id>.teil-<Zeitstempel>.json` mit `job_id` und den `items` dieses Clips (Felder wie im Report), sobald alle Einträge des Clips `restored` oder `failed` sind. Danach verändert der Worker den Clip-Ordner nicht mehr, auch nicht nach einem Neustart. Der Report am Ende enthält weiterhin alle Einträge.
-- Ein Clip ist fertig, wenn alle Ark-Jobs mit seinen Dateien beendet sind. Liegen alle Dateien eines Jobs auf einem Band (ein Ark-Job), kommen seine Teilberichte daher gesammelt am Ende dieses Ark-Jobs.
+## Ergebnisse für Marathon
 
-Der Adapter verarbeitet nur Jobs mit `schema_version = 6`.
+Der bestehende Vertrag bleibt erhalten:
 
-## Restorer direkt einbinden
+- Je Datei `clip_id`, `flow_hash`, `status` (`restored` oder `failed`), `path` und `reason`.
+- Erfolg verlangt eine Datei im erwarteten Ziel mit exakt der angegebenen Größe und ohne temporäre Endung `.tmp`, `.part` oder `.partial`.
+- Vorprüfung meldet `PREFLIGHT_BLOCKED`, `PREFLIGHT_OFFLINE` oder `PREFLIGHT_INVALID` als Fehlergrund; es gibt keinen neuen Marathon-Status.
+- Ein gemischter Job hat `status=failed`. Marathon übernimmt trotzdem seine vollständigen erfolgreichen Clips. Zurückgestellte Clips werden wie bisher inaktiv und als fehlgeschlagener Versuch gezählt.
+- Nach Beheben der Ursache mit Marathons vorhandenem `retry-restore` bewusst wieder freigeben. **Dieser Befehl gibt alle dafür geeigneten inaktiven Restore-Clips frei**, nicht nur Vorprüfungsfehler.
+- Teilberichte je fertigem Clip; Abschlussreport enthält weiterhin jeden Job-Eintrag. Bereits gemeldete Clips werden nach Neustart nicht erneut angefordert oder gemeldet.
+
+## Python-Modul verwenden
+
+Ohne EXE genügt `pip install -e .`; Zugangsdaten in einer eigenen `cred.env` führen. Die Sperrdatei vorher anlegen und ihren Pfad übergeben:
 
 ```python
 from restorer import RestorerJob, run
 
-items = [{"clip_id": "4711", "clip_name": "Film A.mov", "file": "A001.mov",
-          "flow_hash": "2:9f3c…", "tape": "LS2048L8", "size": 15142012345}]
+items = [{"clip_id": "4711", "clip_name": "Film A", "file": "A001.mov",
+          "flow_hash": "2:" + "0" * 32, "tape": "TAPE001", "size": 12345}]
 
 def on_result(job, result):
     print(result.key, result.state, result.summary)
 
-run([RestorerJob("auftrag-1", items, r"\\10.0.77.11\Ablage KI Proxy_1\Proxy 10 Mbit\restore")], on_result)
+run([RestorerJob("auftrag-1", items, r"\\server\share\restore")], on_result,
+    cred_path="cred.env", journal_path="restorer.journal.json",
+    blocked_tapes_path="blocked_tapes.txt", max_files_per_ark_job=50,
+    finish_wait_minutes=5)
 ```
 
-Ist `restorer` in ein anderes Projekt installiert, zeigen die Standardpfade ins Installationsverzeichnis von Python; dann `cred_path`, `journal_path` und `log_path` angeben.
+Beispielwerte durch eigene Daten ersetzen. `output_folder` muss ein UNC-Pfad sein und zur aktiven Ark-Freigabe passen; Laufwerksbuchstaben werden abgelehnt.
 
-`run()` kehrt zurück, wenn `jobs` erschöpft ist und alle Ark-Jobs beendet sind. Es gibt nichts zurück; jedes Ergebnis kommt über `on_result`.
+`run(jobs, on_result, *, on_log=None, on_status=None, on_clip=None, cred_path=None, journal_path=None, log_path=None, poll_seconds=10, max_ark_queue=0, stall_minutes=60, reserve_gb=50, max_files_per_ark_job=None, blocked_tapes_path=None, finish_wait_minutes=5)`
 
-| Parameter | Standard | Bedeutung |
-|---|---|---|
-| `jobs` | Pflicht | Liste oder Generator von `RestorerJob(key, items, output_folder)`; `key` eindeutig. Ein Generator darf `None` liefern, wenn gerade kein Auftrag vorliegt, und wird bei der nächsten Abfrage erneut gefragt |
-| `on_result(job, result)` | Pflicht | wird je fertigem Auftrag mit seinem `RestorerResult` aufgerufen |
-| `on_log(message)` | Konsole mit Uhrzeit und `log_path` | Ereigniszeilen |
-| `on_status(lines)` | Konsole | Statusblock, je Ark-Job eine Zeile; ohne echte Konsole nicht ausgegeben |
-| `on_clip(job, files)` | – | wird je Clip einmal aufgerufen, sobald alle seine Einträge fertig sind; `files` wie in `RestorerResult.files`. Danach ändert der Restorer den Clip-Ordner nicht mehr, auch nicht nach einem Neustart. Ein Fehler im Aufruf steht im Log; das Ergebnis kommt trotzdem über `on_result` |
-| `cred_path` | `cred.env` im Projektordner | Ark-Zugangsdaten |
-| `journal_path` | `restorer.journal.json` im Projektordner | Journal |
-| `log_path` | `restorer.log` im Projektordner | Log, nur ohne `on_log` |
-| `poll_seconds` | `10` | Abfrageintervall |
-| `max_ark_queue` | `0` | Steuerung, siehe „Steuerung“ |
-| `stall_minutes` | `60` | Minuten ohne Fortschritt im Status `Running` bis zum Stopp |
-| `reserve_gb` | `50` | Platzreserve im Ziel in GB (10^9 Byte) |
+- `jobs`: Liste oder Generator von `RestorerJob(key, items, output_folder)`; eindeutiger `key`. Ein Generator darf vorübergehend `None` liefern.
+- `on_result(job, result)`: einmal je abgeschlossenem Auftrag. `run()` liefert nichts zurück.
+- `on_clip(job, files)`: optional, einmal je fertigem Clip. Danach bleibt dessen Ordner unangetastet.
+- `on_log(message)` und `on_status(lines)`: optional, andernfalls Konsole/Log.
+- `cred_path`, `journal_path`, `log_path`: bei Installation in einem anderen Projekt eigene beschreibbare Pfade verwenden. Standardpfade liegen im Installationsverzeichnis.
+- `blocked_tapes_path=None`: keine externe Liste; automatisch erkannte Sperren wirken in der Sitzung. Für den Betrieb eine Datei übergeben. Der Marathon-Launcher tut das immer.
+- `versions()`: Versionen von Restorer, toolbox und ArkAPI.
 
-`versions()` liefert die Versionen von Restorer, toolbox und ArkAPI.
+`items` enthält je Datei `clip_id`, `clip_name`, `file`, `flow_hash` (Version 2), `tape` und `size` (Byte). `RestorerResult` enthält `key`, `state` (`ok`, `partial`, `failed`), `summary`, `files`, `ark_jobs` und `versions`. `files` enthält die Eingabefelder plus Ergebnis, Grund und vollständigen Zielpfad.
 
-### Einträge in `items`
+## Lokale Tests
 
-Je Datei ein Eintrag, alle Felder Pflicht:
+Ohne Ark-Zugriff, echte Zugangsdaten oder EXE-Bau:
 
-| Feld | Inhalt |
-|---|---|
-| `clip_id` | Einträge mit gleicher `clip_id` gehören zu einem Clip |
-| `clip_name` | Name des Clip-Ordners |
-| `file` | physischer Dateiname aus dem Userpath, nicht Clip- oder Asset-Name |
-| `flow_hash` | FLOW-Hash Version 2, `2:<hex>` |
-| `tape` | Barcode des Bands |
-| `size` | Größe in Byte |
+```console
+python -m unittest discover -s tests -v
+```
 
-### Ergebnis `RestorerResult`
-
-| Feld | Inhalt |
-|---|---|
-| `key` | wie im Auftrag |
-| `state` | `ok` (alle Dateien `restored`), `partial` (einige), `failed` (keine) |
-| `summary` | Kurztext |
-| `files` | je Eintrag die Felder aus `items` plus `state` (`restored`/`failed`), `reason`, vollständiger `path` |
-| `ark_jobs` | je Ark-Job Session-ID, Band, Hashes, Ark-Status, Start, Dauer, Versuch, `reason` (Grund für eigenen Stopp oder Ark-Text, sonst `null`) |
-| `versions` | wie `versions()` |
-
-## Zielpfad und Clip-Ordner
-
-- `output_folder` muss die Form `\\server\freigabe\…` haben; Laufwerksbuchstaben werden abgelehnt.
-- Die Freigabe muss einem aktiven Media Space in Ark entsprechen, ohne Groß-/Kleinschreibung, zuerst genau, dann ohne Endung `_<Zahl>`: `Ablage KI Proxy_1` → `Ablage KI Proxy`. Kein oder mehrere Treffer: Auftrag `failed` mit `INVALID_INPUT`.
-- Ziel jeder Datei: `<output_folder>/<Clip-Ordner>/<file>`. Clip-Ordner = `clip_name`; `<>:"/\|?*` und Steuerzeichen werden zu `_`, Punkte und Leerzeichen am Ende entfallen. Gleicher Clip-Ordner für verschiedene `clip_id` im selben Auftrag: erster ohne Zusatz, weitere `__2`, `__3` …
-- Dateinamen werden nie verändert.
-- Eine Datei ist `restored`, wenn sie am Ziel liegt, ihre Größe `size` entspricht und sie nicht auf `.tmp`, `.part` oder `.partial` endet. Solche Dateien werden nicht erneut geholt, auch wenn ihr Band nicht in der Library liegt.
-
-## Ablauf je Auftrag
-
-1. Eingabe prüfen: Pflichtfelder, Hash-Format, doppelte Einträge, Zielpfad.
-2. Bereits vollständige Dateien als `restored` übernehmen.
-3. Bei Ark prüfen: Datei bekannt, angegebenes Band unter ihren Kopien, Band in der Library. Sonst sofort `failed`; auf Bänder wird nicht gewartet.
-4. Je Band bzw. Bandkombination ein Ark-Job, gesendet nach Steuerung und Bandsperre.
-5. Vor dem Senden jedes Ark-Jobs, auch nach Halbieren oder Neusenden: freier Platz an `\\server\freigabe\` abzüglich der ausstehenden Bytes aller Restores in Ark zum selben Media Space (eigene und fremde) muss für die Dateien dieses Ark-Jobs plus `reserve_gb` reichen. Sonst wartet der Ark-Job, und die Prüfung wird bei jeder Abfrage wiederholt; bis dahin werden keine weiteren Ark-Jobs gesendet und keine neuen Aufträge angenommen. Laufende Ark-Jobs laufen weiter. Wartende Ark-Jobs ohne Datenmenge deckt `reserve_gb` ab.
-6. Überwachen, bei Bedarf stoppen, neu senden oder halbieren (siehe „Fälle“).
-7. Jede Datei prüfen, jeden fertigen Clip über `on_clip` und das Ergebnis des Auftrags über `on_result` melden.
-
-## Steuerung
-
-Gilt für alle eigenen Ark-Jobs gemeinsam. Die Ark-Queue umfasst alle wartenden Ark-Jobs (`Enqueued`), auch fremde; ein eigener Ark-Job ohne Session-ID zählt mit.
-
-| `max_ark_queue` | Verhalten |
-|---|---|
-| `0` | neue Ark-Jobs werden sofort gesendet |
-| `1` | gesendet wird nur, wenn kein Ark-Job wartet, auch kein fremder (Einstellung für Marathon) |
-| `n` | gesendet wird, bis die Ark-Queue `n` Jobs enthält |
-
-Bandsperre: Ein Ark-Job wird nicht gesendet, solange ein eigener Ark-Job auf einem seiner Bänder angelegt wird, wartet oder läuft, auch aus einem anderen Auftrag. Er wartet, bis der vorige Ark-Job beendet ist (Ereigniszeile und Statusblock nennen das Band).
-
-Reihenfolge: zuerst Halbierungen und Neusendungen, dann weitere Bänder des aktuellen Auftrags, dann der nächste Auftrag. Ark-Jobs auf gesperrten Bändern werden übersprungen; spätere Ark-Jobs auf freien Bändern gehen vor. Ein Ark-Job, der auf Speicherplatz wartet, wird nicht überholt. Mehr Durchsatz: `max_ark_queue` erhöhen oder `0`.
-
-## Fälle
-
-Halbieren: Die offenen Dateien eines Ark-Jobs werden in zwei neuen Ark-Jobs angefordert, wiederholt, bis eine einzelne Datei scheitert. Unvollständige Dateien am Ziel werden vorher gelöscht.
-
-| Fall | Aktion | Grund der Datei |
-|---|---|---|
-| Band fehlt während des Laufs | stoppen | `TAPES_OFFLINE` |
-| Band defekt (Tape-Alarm `Media`) | stoppen, Band nicht erneut anfordern | `TAPE_DEFECT` |
-| Laufwerk braucht Diagnose (Tape-Alarm `Diagnostics Required`) | stoppen, einmal unverändert neu senden | `DRIVE_ERROR` |
-| Lese-/Schreibfehler (Tape-Alarm `Hard error`) | stoppen, halbieren | `ARK_ERROR` |
-| Fehler im Lauf (Status `Error`) | stoppen, halbieren | `ARK_ERROR` |
-| Kein Fortschritt im Status `Running` für `stall_minutes` | stoppen, halbieren | `STALLED` |
-| Ende `Partially Complete` | fehlende Dateien halbieren | `ARK_ERROR` |
-| Ende `Complete`, Datei fehlt oder Größe falsch | halbieren | `INCOMPLETE` |
-| Ende `Unknown` | einmal unverändert neu senden | `ARK_ERROR` |
-| Ende `Insufficient Space` | einmal unverändert neu senden, vorher auf Speicherplatz warten | `NO_SPACE` (beim zweiten Mal) |
-| in Ark von Hand abgebrochen | – | `CANCELLED` |
-
-Tape-Alarme, die über die Tape-Job-Nummer sicher zu einem eigenen Ark-Job gehören, werden nach dessen Ende in Ark quittiert, außer Nr. 4 „Media“ und Nr. 39 „Diagnostics Required“. Alarme fremder Jobs werden nie quittiert. Jede Quittierung steht im Log.
-
-Weitere Gründe: `INVALID_INPUT` (Eingabe, Zielpfad, Media Space), `NOT_IN_ARK`, `TAPE_MISMATCH` (Band nicht unter Arks Kopien), `DUPLICATE_FILE` (gleicher Dateiname im selben Clip-Ordner mit anderem Hash; alle betroffenen Einträge scheitern), `ORPHANED` (Ark-Job nach Neustart in Ark unbekannt, Datei fehlt oder unvollständig). Jede Aktion steht mit Quelle und Ark-Text im Log.
-
-## Journal und Neustart
-
-- Das Journal enthält alle angelegten Ark-Jobs mit `key` und Ergebnis sowie die schon gemeldeten Clips offener Aufträge. Nur darüber werden Ark-Jobs nach einem Neustart ihrem Auftrag zugeordnet. Nicht löschen oder bearbeiten, solange Einträge offen sind.
-- Ein Journal wird von genau einem Prozess genutzt.
-- Beim Start werden offene Ark-Jobs wieder überwacht oder ausgewertet. Aufträge mit `key` im Journal werden sofort angenommen; nur Dateien ohne Ark-Job werden neu angefordert. Schon gemeldete Clips behalten ihr Ergebnis; ihre Dateien werden nicht erneut angefordert, der Clip wird nicht erneut gemeldet.
-- Kommt ein Auftrag nach dem Neustart nicht erneut, laufen seine Ark-Jobs bis zum Ende weiter und werden im Log gemeldet.
-- Ein `key`, der gerade bearbeitet wird, wird verworfen (Meldung im Log). Abgeschlossene Einträge werden automatisch entfernt; derselbe `key` danach ist ein neuer Auftrag.
-
-## Grenzen
-
-- Bänder werden weder angefordert noch eingelegt; fehlende Bänder führen zu `TAPES_OFFLINE`.
-- Dateien werden nicht umbenannt.
-- Ein Ark-Job wird nicht geteilt, um in den freien Platz zu passen; er wartet, bis genug Platz frei ist (z. B. weil Marathon fertige Clips übernimmt oder von Hand Platz geschaffen wird).
-- Benachrichtigungen in Ark werden nicht quittiert (dafür gibt es keinen Endpunkt); quittiert werden nur eigene Tape-Alarme (siehe „Fälle“).
+Die Tests verwenden lokale temporäre Dateien und isolierte Ark-/Build-Platzhalter. Ein echter Windows-EXE-Bau und das Verhalten der Produktions-Ark-Installation müssen in der jeweiligen Umgebung geprüft werden.

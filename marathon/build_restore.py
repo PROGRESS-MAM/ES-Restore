@@ -7,11 +7,12 @@ import PyInstaller.__main__
 
 # --------- CONFIG ---------
 app_name = "Restore Marathon Build"
-app_version = "0.1.0"
+app_version = "0.2.0"
 
 project = Path(__file__).resolve().parents[1]
 build_folder = project / "build"
 cred_file = project / "marathon" / "cred.env"
+blocked_tapes_file = project / "marathon" / "blocked_tapes.txt"
 
 
 # --------- FUNC ---------
@@ -36,6 +37,8 @@ def _version_file(name: str, version: str, exe_name: str) -> Path:
 def main() -> None:
     if not cred_file.is_file():
         sys.exit(f"Zugangsdaten fehlen: {cred_file} mit ARK_HOST, ARK_USER, ARK_PASSWORD anlegen.")
+    if not blocked_tapes_file.is_file():
+        sys.exit(f"Sperrdatei fehlt: {blocked_tapes_file}; eine UTF-8-Datei mit einer Bandkennung je Zeile anlegen.")
     sys.path.insert(0, str(project))
     from marathon import restore_marathon
     exe_name = f"restore_marathon_{restore_marathon.app_version}"
@@ -46,6 +49,13 @@ def main() -> None:
         "--version-file", str(_version_file(restore_marathon.app_name, restore_marathon.app_version, exe_name)),
         "--distpath", str(project / "dist"), "--workpath", str(build_folder), "--specpath", str(build_folder),
     ])
+
+    destination = project / "dist" / blocked_tapes_file.name
+    try:
+        with destination.open("xb") as handle:
+            handle.write(blocked_tapes_file.read_bytes())
+    except FileExistsError:
+        pass  # Never replace an existing operational block list during a rebuild.
 
 
 # --------- EXEC ---------
