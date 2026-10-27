@@ -306,6 +306,31 @@ def _mediaspace_name(share: str, names: list[str]) -> str:
     raise ValueError(f"Freigabe {share} passt zu mehreren Media Spaces: {', '.join(found)}")
 
 
+def _plan_ark_files(files: list[_File], max_files_per_ark_job: int | None) -> list[list[_File]]:
+    groups: dict[tuple[str, ...], list[_File]] = {}
+    for index, file in enumerate(files):
+        if max_files_per_ark_job is None:
+            key = file.group
+        elif len(file.group) > 1:
+            key = ("spanning", str(index))
+        elif file.group:
+            key = ("tape", file.group[0].casefold())
+        else:
+            key = ("missing", str(index))
+        groups.setdefault(key, []).append(file)
+
+    plans = []
+    for key, grouped_files in groups.items():
+        if max_files_per_ark_job is None:
+            plans.append(grouped_files)
+        elif key[0] != "tape":
+            plans.extend([[file] for file in grouped_files])
+        else:
+            for start in range(0, len(grouped_files), max_files_per_ark_job):
+                plans.append(grouped_files[start:start + max_files_per_ark_job])
+    return plans
+
+
 # --------- FUNC CONSOLE ---------
 def _enable_ansi() -> None:
     if os.name != "nt":
@@ -439,9 +464,10 @@ class _Journal:
 # --------- FUNC RUNNER ---------
 class _Runner:
     def __init__(self, jobs, on_result, on_log, on_status, cred_path, journal_path, poll_seconds, max_ark_queue,
-                 stall_minutes, reserve_gb, on_clip=None) -> None:
+                 stall_minutes, reserve_gb, on_clip=None, max_files_per_ark_job=None) -> None:
         self.jobs, self.on_result, self.log, self.on_status = iter(jobs), on_result, on_log, on_status
         self.on_clip = on_clip
+        self.max_files_per_ark_job = max_files_per_ark_job
         self.cred_path, self.poll_seconds, self.max_ark_queue = cred_path, poll_seconds, max_ark_queue
         self.stall_seconds, self.reserve = stall_minutes * 60, int(reserve_gb * 1e9)
         self.journal = _Journal(journal_path)
@@ -681,18 +707,17 @@ class _Runner:
         todo = [f for f in todo if f.state == "open"]
         if todo:
             todo = self._check_ark(todo)
-        groups: dict[tuple[str, ...], list[_File]] = {}
-        for f in todo:
-            groups.setdefault(f.group, []).append(f)
-        for files in groups.values():
+        plans = _plan_ark_files(todo, self.max_files_per_ark_job)
+        for files in plans:
             job = _ArkJob(task.job.key, files, task.mediaspace, task.share_root, task=task)
             task.ark_jobs.append(job)
             self.ark_list.append(job)
             self.group_queue.append(job)
         states = Counter(f.state for f in task.files)
         failed = sum(1 for entry in task.entries if entry["reason"]) + states["failed"]
+        tapes = ["+".join(dict.fromkeys(tape for f in files for tape in (f.group or (f.tape,)))) for files in plans]
         self.log(f"Restorer-Job {task.job.key}: {states['restored']} Dateien schon vollständig, {failed} gescheitert, "
-                 f"{len(groups)} Ark-Jobs geplant" + (f" (Bänder {', '.join('+'.join(group) for group in groups)})" if groups else ""))
+                 f"{len(plans)} Ark-Jobs geplant" + (f" (Bänder {', '.join(tapes)})" if plans else ""))
 
     def _check_ark(self, files: list[_File]) -> list[_File]:
         def fail(f, code, text=None):
@@ -706,15 +731,24 @@ class _Runner:
         for f in files:
             info = infos.get(f.flow_hash) or {}
             copies = [list(copy) for copy in info.get("copies") or []]
-            copy = next((copy for copy in copies if f.tape.casefold() in {tape.casefold() for tape in copy}), None)
+            if self.max_files_per_ark_job is None:
+                copy = next((copy for copy in copies if f.tape.casefold() in {tape.casefold() for tape in copy}), None)
+            else:
+                # Tape-only requests have no copy selector, so use Ark's first returned tape copy.
+                copy = next((copy for copy in copies if copy), None)
             if info.get("reason") == "INVALID_HASH":
                 fail(f, "INVALID_INPUT", "Ark lehnt den Hash ab")
             elif not info.get("in_ark"):
                 fail(f, "NOT_IN_ARK")
             elif copy is None:
-                fail(f, "TAPE_MISMATCH", f"Band {f.tape} nicht unter Arks Kopien ({', '.join('+'.join(c) or 'Disk' for c in copies)})")
-            else:
+                message = (f"Band {f.tape} nicht unter Arks Kopien ({', '.join('+'.join(c) or 'Disk' for c in copies)})"
+                           if self.max_files_per_ark_job is None else
+                           f"Keine auswählbare Bandkopie in Ark ({', '.join('+'.join(c) or 'Disk' for c in copies)})")
+                fail(f, "TAPE_MISMATCH", message)
+            elif self.max_files_per_ark_job is None:
                 f.copies, f.group = copies, tuple(sorted(copy, key=str.casefold))
+            else:
+                f.copies, f.group = copies, tuple(dict.fromkeys(str(tape) for tape in copy))
         files = [f for f in files if f.state == "open"]
         tapes = list(dict.fromkeys(tape for f in files for tape in f.group))
         if not tapes:
@@ -1326,7 +1360,8 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
         on_log: Callable[[str], object] | None = None, on_status: Callable[[list[str]], object] | None = None,
         on_clip: Callable[[RestorerJob, list[dict]], object] | None = None,
         cred_path: str | Path | None = None, journal_path: str | Path | None = None, log_path: str | Path | None = None,
-        poll_seconds: float = 10, max_ark_queue: int = 0, stall_minutes: float = 60, reserve_gb: float = 50) -> None:
+        poll_seconds: float = 10, max_ark_queue: int = 0, stall_minutes: float = 60, reserve_gb: float = 50,
+        max_files_per_ark_job: int | None = None) -> None:
     """Restore the files of all jobs from LTO tape via Ark; returns when jobs is exhausted and all Ark jobs ended.
 
     jobs: list or generator of RestorerJob; a generator yields None while no order is available.
@@ -1335,6 +1370,7 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
     on_clip(job, files) is called once per clip as soon as all its entries are finished (files as in RestorerResult);
     the restorer does not change that clip folder afterwards, also not after a restart (the journal keeps such clips).
     max_ark_queue: 0 sends new Ark jobs at once, n >= 1 sends while fewer than n Ark jobs wait in Ark.
+    max_files_per_ark_job: optional file cap for each planned Ark job; None preserves the existing grouping.
     Ctrl+C stops the restorer, not the Ark jobs; the next start resumes them from the journal.
     Raises ValueError for invalid parameters, FileNotFoundError/RuntimeError if Ark or the journal are not usable.
     """
@@ -1349,10 +1385,15 @@ def run(jobs: Iterable[RestorerJob | None], on_result: Callable[[RestorerJob, Re
         raise ValueError("max_ark_queue muss eine ganze Zahl >= 0 sein.")
     if isinstance(reserve_gb, bool) or not isinstance(reserve_gb, (int, float)) or reserve_gb < 0:
         raise ValueError("reserve_gb muss eine Zahl >= 0 sein.")
+    if max_files_per_ark_job is not None and (isinstance(max_files_per_ark_job, bool)
+                                               or not isinstance(max_files_per_ark_job, int)
+                                               or max_files_per_ark_job <= 0):
+        raise ValueError("max_files_per_ark_job muss eine ganze Zahl > 0 sein.")
     console = _Console(Path(log_path or default_log_path)) if on_log is None or on_status is None else None
     on_log, on_status = on_log or console.log, on_status or console.status
     runner = _Runner(jobs, on_result, on_log, on_status, Path(cred_path or default_cred_path),
-                     Path(journal_path or default_journal_path), poll_seconds, max_ark_queue, stall_minutes, reserve_gb, on_clip)
+                     Path(journal_path or default_journal_path), poll_seconds, max_ark_queue, stall_minutes, reserve_gb,
+                     on_clip, max_files_per_ark_job)
     try:
         runner.loop()
     except KeyboardInterrupt:

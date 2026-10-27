@@ -101,6 +101,7 @@ Ergebnis: `dist/restore_marathon_<app_version>.exe` mit Adapter, Paket `restorer
 | `poll_seconds` | `10` | Abfrageintervall für Pool und Ark |
 | `heartbeat_seconds` | `30` | Abstand der Lebenszeichen an Marathon, 1 bis 60 |
 | `max_ark_queue` | `1` | Steuerung, siehe „Steuerung“ |
+| `max_files_per_ark_job` | `50` | Höchstzahl Dateien je Ark-Job auf einem Band; Dateien mit mehrteiliger Bandkopie erhalten einen eigenen Ark-Job |
 | `stall_minutes` | `60` | Minuten ohne Fortschritt im Status `Running` bis zum Stopp |
 | `reserve_gb` | `500` | Platzreserve im Ziel in GB (10^9 Byte); deckt auch wartende Ark-Jobs ab, für die Ark noch keine Datenmenge meldet |
 

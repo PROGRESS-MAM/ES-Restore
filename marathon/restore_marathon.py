@@ -21,6 +21,7 @@ heartbeat_seconds = 30
 max_ark_queue = 1
 stall_minutes = 60
 reserve_gb = 2000
+max_files_per_ark_job = 50
 
 
 # --------- STATIC ---------
@@ -99,7 +100,8 @@ def work() -> None:
     restorer.run(_orders(), _on_result, on_log=lambda message: adapter.log(_short(message)),
                  on_status=lambda lines: adapter.status(_short("\n".join(lines))), on_clip=_on_clip, cred_path=cred_path,
                  journal_path=journal_path, poll_seconds=poll_seconds, max_ark_queue=max_ark_queue,
-                 stall_minutes=stall_minutes, reserve_gb=reserve_gb)
+                 stall_minutes=stall_minutes, reserve_gb=reserve_gb,
+                 max_files_per_ark_job=max_files_per_ark_job)
 
 
 # --------- MAIN ---------
